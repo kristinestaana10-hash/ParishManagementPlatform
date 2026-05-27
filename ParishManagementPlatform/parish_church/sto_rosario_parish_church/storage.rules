@@ -1,0 +1,29 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Profile images - users can upload their own profile images
+    match /profile_images/{imageId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && 
+        imageId.matches(request.auth.uid + '.*');
+    }
+    
+    // Document images - users can upload their own sacrament requirement documents
+    match /documents/{userId}/{documentId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Requirements documents - users can upload their own sacrament requirement documents
+    match /requirements/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && 
+        fileName.matches(request.auth.uid + '.*');
+    }
+    
+    // Deny all other access by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

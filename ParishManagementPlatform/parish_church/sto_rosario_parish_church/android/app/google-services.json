@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "817236988593",
+    "project_id": "parish-management-615a4",
+    "storage_bucket": "parish-management-615a4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:817236988593:android:3c2770b43d16551df10890",
+        "android_client_info": {
+          "package_name": "ParishManagement.System"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC85lq5ZKtoYCIDwMjhLYN1JZAz-OmcMlg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

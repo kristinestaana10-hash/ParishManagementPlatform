@@ -1,0 +1,370 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.admin == true ||
+        request.auth.token.role == 'admin'
+      );
+    }
+
+    function isStringMap(m) {
+      return m is map && m.size() <= 400 && m.values().all(v, v is string);
+    }
+
+    function isGodparentsList(l) {
+      return l is list
+          && l.size() <= 50
+          && l.all(g,
+            g is map
+            && g.size() <= 20
+            && g.values().all(v, v is string)
+          );
+    }
+
+    function isValidDonation(data) {
+      return data.keys().hasAll([
+        'userId','userName','userEmail','donationType','isAnonymous',
+        'submittedAt','status'
+      ]) &&
+      data.userId is string &&
+      data.userName is string &&
+      data.userEmail is string &&
+      data.status is string &&
+      (data.status == 'pending' || data.status == 'paid' || data.status == 'failed') &&
+      data.donationType is string &&
+      // Conditional validation based on donation type
+      (
+        (data.donationType == 'monetary' && 
+         data.keys().hasAll(['amount','currency','paymentMethod']) &&
+         data.amount is number && data.amount > 0 &&
+         data.currency is string &&
+         data.paymentMethod is string
+        ) ||
+        (data.donationType == 'inKind' && 
+         data.keys().hasAll(['items','description']) &&
+         data.items is string && data.items.size() > 0 &&
+         data.description is string && data.description.size() > 0
+        ) ||
+        (data.donationType == 'other' && 
+         data.keys().hasAll(['description']) &&
+         data.description is string && data.description.size() > 0
+        )
+      );
+    }
+
+    function isValidMassOffering(data) {
+      return data.keys().hasAll([
+        'userId','userName','userEmail','donationType','isAnonymous',
+        'submittedAt','status','amount','currency','paymentMethod','offeringLocation'
+      ]) &&
+      data.userId is string &&
+      data.userName is string &&
+      data.userEmail is string &&
+      data.status is string &&
+      (data.status == 'pending' || data.status == 'paid' || data.status == 'failed') &&
+      data.donationType == 'massOffering' &&
+      data.amount is number && data.amount > 0 &&
+      data.currency is string &&
+      data.paymentMethod is string &&
+      data.offeringLocation is string && data.offeringLocation.size() > 0;
+    }
+
+    function isValidSacramentRequest(data) {
+      return data.keys().hasAll([
+        'userId','userName','userEmail','sacramentType','details',
+        'submittedAt','updatedAt','status','assignedPriest','adminNotes'
+      ]) &&
+      data.sacramentType is string &&
+      data.status == 'pending' &&
+      data.userId is string &&
+      data.userName is string &&
+      data.userEmail is string &&
+      data.assignedPriest is string &&
+      data.adminNotes is string &&
+      data.details is map &&
+      data.details.keys().hasAll(['fields','additionalGodparents']) &&
+      isStringMap(data.details.fields) &&
+      isGodparentsList(data.details.additionalGodparents);
+    }
+
+    function isValidBookingDetails(details) {
+      return details is map &&
+        details.keys().hasAll(['fields', 'additionalGodparents']) &&
+        details.fields is map &&
+        details.additionalGodparents is list;
+    }
+
+    function isValidBooking(data) {
+      // Validation for initial booking creation ONLY
+      // This ensures new bookings have all required fields
+      return data.keys().hasAll([
+        'userId','userName','userEmail','sacramentType','sacramentTypeKey',
+        'date','time','details','submittedAt','updatedAt','status',
+        'assignedPriest','adminNotes','structuredId'
+      ]) &&
+      data.userId is string &&
+      data.userName is string &&
+      data.userEmail is string &&
+      data.sacramentType is string &&
+      data.sacramentTypeKey is string &&
+      data.date is string &&
+      data.time is string &&
+      data.status is string &&
+      (data.status == 'pending' || data.status == 'paid' || data.status == 'failed' || data.status == 'confirmed') &&
+      data.assignedPriest is string &&
+      data.adminNotes is string &&
+      data.structuredId is string &&
+      isValidBookingDetails(data.details);
+    }
+
+    function isVisibleBookingStatus(status) {
+      return status in [
+        'pending', 'approved', 'accepted', 'confirmed', 'paid',
+        'Pending', 'Approved', 'Accepted', 'Confirmed', 'Paid'
+      ];
+    }
+
+    function isValidUserProfile(data) {
+      // Validate that all present fields have correct types
+      // This allows partial updates (like just profileImage)
+      return
+        // Check each field individually - if present, must be string
+        (data.uid == null || data.uid is string) &&
+        (data.firstName == null || data.firstName is string) &&
+        (data.lastName == null || data.lastName is string) &&
+        (data.sex == null || data.sex is string) &&
+        (data.birthday == null || data.birthday is timestamp) &&
+        (data.email == null || data.email is string) &&
+        (data.phone == null || data.phone is string) &&
+        (data.address == null || data.address is string) &&
+        (data.profileImage == null || data.profileImage is string) &&
+        (data.role == null || data.role is string) &&
+        (data.status == null || data.status is string) &&
+        (data.lastNameChange == null || data.lastNameChange is timestamp) &&
+        (data.lastUpdated == null || data.lastUpdated is timestamp) &&
+        (data.createdAt == null || data.createdAt is timestamp);
+    }
+
+    match /users/{userId} {
+      // Allow users to read their own documents by either:
+      // 1. The document ID being their Firebase Auth UID (for backward compatibility)
+      // 2. Querying by uid field (using where clause) when authenticated
+      allow create, read, update: if isSignedIn() && (
+          request.auth.uid == userId ||
+          (request.auth != null)  // Allow authenticated users to query by uid field
+      );
+      allow delete: if false;
+    }
+
+    // Add public read access to mass schedules for calendar display
+    match /mass_schedules/{scheduleId} {
+      allow read: if true;  // Public read - schedules are visible to everyone
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    match /donations/{donationId} {
+      // Allow users to read donations:
+      // 1. Their own donations (by userId or email)
+      // 2. Anonymous donations (for the Anonymous tab)
+      allow read: if (isSignedIn() && (
+          resource.data.userId == request.auth.uid ||
+          resource.data.email == request.auth.token.email ||
+          resource.data.userEmail == request.auth.token.email
+      )) || resource.data.isAnonymous == true;
+      
+      // Allow both authenticated and guest users to create donations
+      // For authenticated users: userId must match auth.uid
+      // For guest users: userId must start with 'guest_'
+      allow create: if isValidDonation(request.resource.data) && (
+          (isSignedIn() && request.resource.data.userId == request.auth.uid) ||
+          (!isSignedIn() && request.resource.data.userId.matches('^guest_.*'))
+      );
+      
+      // Allow updates for payment processing (xendit webhook, admin updates)
+      allow update: if isSignedIn() && (
+          resource.data.userId == request.auth.uid ||
+          request.auth.token.admin == true
+      );
+      
+      allow delete: if false;
+    }
+
+    match /mass_offerings/{offeringId} {
+      // Allow users to read mass offerings:
+      // 1. Their own mass offerings (by userId or email)
+      // 2. Anonymous mass offerings
+      allow read: if (isSignedIn() && (
+          resource.data.userId == request.auth.uid ||
+          resource.data.email == request.auth.token.email ||
+          resource.data.userEmail == request.auth.token.email
+      )) || resource.data.isAnonymous == true;
+      
+      // Allow both authenticated and guest users to create mass offerings
+      allow create: if isValidMassOffering(request.resource.data) && (
+          (isSignedIn() && request.resource.data.userId == request.auth.uid) ||
+          (!isSignedIn() && request.resource.data.userId.matches('^guest_.*'))
+      );
+      
+      // Allow updates for payment processing (xendit webhook, admin updates)
+      allow update: if isSignedIn() && (
+          resource.data.userId == request.auth.uid ||
+          request.auth.token.admin == true
+      );
+      
+      allow delete: if false;
+    }
+
+    match /bookings/{bookingId} {
+      allow create: if isSignedIn()
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.structuredId == bookingId
+          && isValidBooking(request.resource.data);
+      allow get: if isSignedIn() && (
+          resource.data.userId == request.auth.uid ||
+          resource.data.userEmail == request.auth.token.email ||
+          isAdmin()
+      );
+      allow list: if isSignedIn() && (
+          resource.data.userId == request.auth.uid ||
+          resource.data.userEmail == request.auth.token.email ||
+          isVisibleBookingStatus(resource.data.status) ||
+          isAdmin()
+      );
+      // Allow updates without validation restrictions:
+      // 1. Booking owner can update their own bookings (for payment status updates)
+      // 2. Admins can update any booking
+      // Note: Validation on update is deliberately REMOVED to allow status changes
+      //       from 'pending' to 'paid' via xendit webhook
+      allow update: if isSignedIn() && (
+          resource.data.userId == request.auth.uid ||
+          request.auth.token.admin == true
+      );
+      allow delete: if false;
+    }
+
+    match /sacrament_requests/{requestId} {
+      allow create: if isSignedIn()
+          && request.resource.data.userId == request.auth.uid;
+      allow read: if isSignedIn();
+      allow update, delete: if false;
+    }
+
+    match /users/{userId}/sacrament_requests/{requestId} {
+      allow create: if isSignedIn()
+          && request.auth.uid == userId
+          && request.resource.data.userId == request.auth.uid
+          && isValidSacramentRequest(request.resource.data);
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow update, delete: if false;
+    }
+
+    match /announcements/{announcementId} {
+      allow read: if true;
+      allow create, update, delete: if false;
+    }
+
+    // Counters collection for structured ID generation
+    match /counters/{counterId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Requirements collection for sacrament requirements
+    match /requirements/{requirementId} {
+      // Users can read their own requirements
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      
+      // Users can create requirements for themselves
+      allow create: if isSignedIn() && 
+        request.auth.uid == request.resource.data.userId &&
+        request.resource.data.sacramentType is string &&
+        request.resource.data.requirementType is string &&
+        request.resource.data.documentName is string;
+      
+      // Users can update their own requirements (for status updates)
+      allow update: if isSignedIn() && resource.data.userId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'adminNotes', 'validationResult', 'updatedAt']);
+      
+      // Admins can read all requirements and update status
+      allow read, update: if isSignedIn() && isAdmin();
+    }
+
+    // Parish profile collection for church information
+    match /parish_profile/{profileId} {
+      allow read: if true; // Public read access for parish information
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // Booking form definitions for sacrament/service content.
+    // Public read keeps the booking flow available to guests/readers; only
+    // admins may manage content.
+    match /booking_forms/{formId} {
+      allow read: if true;
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // Fallback for nested parish_profile subcollections if used anywhere in the database
+    match /{path=**}/parish_profile/{profileId} {
+      allow read: if true;
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+// ========================================================================
+// SCHEDULING COLLECTIONS - AI-Driven Scheduling Engine
+// ========================================================================
+
+// Mass Schedule collection - Official parish Mass times
+match /massSchedules/{scheduleId} {
+  // Anyone can read Mass schedules to see available times
+  allow read: if true;
+  
+  // Only admins can create/update/delete Mass schedules
+  allow create, update, delete: if isSignedIn() && isAdmin();
+}
+
+// Booking availability cache (optional - for performance)
+match /bookingAvailability/{availabilityId} {
+  // Public read access for availability info
+  allow read: if true;
+  
+  // Cloud Functions can write availability cache
+  allow create, update: if request.auth.uid == '';
+  allow delete: if isSignedIn() && isAdmin();
+}
+
+// Scheduling audit log for admin review
+match /schedulingAudit/{auditId} {
+  // Users can read their own audit entries
+  allow read: if isSignedIn() && (
+    resource.data.userId == request.auth.uid ||
+    request.auth.token.admin == true
+  );
+  
+  // Cloud Functions and admins can create audit entries
+  allow create: if request.auth.uid == '' || (isSignedIn() && isAdmin());
+  
+  // Admins can update/delete for maintenance
+  allow update, delete: if isSignedIn() && isAdmin();
+}
+
+// Booking conflict history for debugging and analytics
+match /bookingConflicts/{conflictId} {
+  // Users can read their own conflict history
+  allow read: if isSignedIn() && (
+    resource.data.userId == request.auth.uid ||
+    request.auth.token.admin == true
+  );
+  
+  // Cloud Functions log conflicts automatically
+  allow create: if request.auth.uid == '';
+  
+  // Admins can manage conflict records
+  allow update, delete: if isSignedIn() && isAdmin();
+}
+  }
+}
