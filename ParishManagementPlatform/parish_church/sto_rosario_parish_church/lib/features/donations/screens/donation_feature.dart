@@ -41,6 +41,9 @@ class DonationFeature extends StatefulWidget {
 
 class _DonationFeatureState extends State<DonationFeature>
     with SingleTickerProviderStateMixin {
+  static const _generalMonetaryDonationDescription =
+      'This monetary donation is considered a general donation for the parish church and will be used to support its ministries, programs, and ongoing needs. If you wish to contribute to a specific cause, please wait for the official donation drive dedicated to that purpose.';
+
   DonationType _selectedType = DonationType.monetary;
   bool _isAnonymous = false;
   bool _isLoading = false;
@@ -218,6 +221,10 @@ class _DonationFeatureState extends State<DonationFeature>
           );
         }
 
+        final donationDescription = _selectedType == DonationType.monetary
+            ? _generalMonetaryDonationDescription
+            : _descriptionController.text.trim();
+
         final result = _selectedType == DonationType.massOffering
             ? await FirebaseService.instance.createXenditMassOfferingInvoice(
                 amount: amountValue,
@@ -229,7 +236,7 @@ class _DonationFeatureState extends State<DonationFeature>
                 donationType: _selectedType.name,
                 phone: phoneFormatted,
                 items: _itemsController.text.trim(),
-                description: _descriptionController.text.trim(),
+                description: donationDescription,
                 message: _messageController.text.trim(),
                 offeringLocation: _selectedOfferingLocation,
               )
@@ -243,7 +250,7 @@ class _DonationFeatureState extends State<DonationFeature>
                 donationType: _selectedType.name,
                 phone: phoneFormatted,
                 items: _itemsController.text.trim(),
-                description: _descriptionController.text.trim(),
+                description: donationDescription,
                 message: _messageController.text.trim(),
                 offeringLocation: _selectedOfferingLocation,
               );
@@ -603,22 +610,6 @@ class _DonationFeatureState extends State<DonationFeature>
           description: t('Handog para sa Misa', 'Offering for Mass'),
           isMobile: isMobile,
         ),
-        const SizedBox(height: 12),
-        _buildTypeButton(
-          type: DonationType.inKind,
-          label: t('Mga Bagay', 'In-Kind'),
-          icon: Icons.card_giftcard,
-          description: t('Mga produkto o gamit', 'Products or items'),
-          isMobile: isMobile,
-        ),
-        const SizedBox(height: 12),
-        _buildTypeButton(
-          type: DonationType.other,
-          label: t('Iba', 'Other'),
-          icon: Icons.volunteer_activism,
-          description: t('Iba pang uri ng suporta', 'Other forms of support'),
-          isMobile: isMobile,
-        ),
       ],
     );
   }
@@ -918,9 +909,11 @@ class _DonationFeatureState extends State<DonationFeature>
                       donations.sort((a, b) {
                         final aData = a.data();
                         final bData = b.data();
-                        final aTime = aData['submittedAt'] as Timestamp?;
-                        final bTime = bData['submittedAt'] as Timestamp?;
-                        if (aTime == null || bTime == null) return 0;
+                        final aTime = _parseTimestamp(aData['submittedAt']);
+                        final bTime = _parseTimestamp(bData['submittedAt']);
+                        if (aTime == null && bTime == null) return 0;
+                        if (aTime == null) return 1;
+                        if (bTime == null) return -1;
                         return bTime.compareTo(aTime);
                       });
 
@@ -978,8 +971,7 @@ class _DonationFeatureState extends State<DonationFeature>
                           ),
                           ...donations.map((doc) {
                             final donation = doc.data();
-                            final submittedAt =
-                                donation['submittedAt'] as Timestamp?;
+                            final submittedAt = _parseTimestamp(donation['submittedAt']);
                             final amount =
                                 (donation['amount'] as num?)?.toDouble() ?? 0.0;
                             final donationType =
@@ -1194,10 +1186,25 @@ class _DonationFeatureState extends State<DonationFeature>
     return '';
   }
 
-  String _formatTimestamp(Timestamp? timestamp) {
-    if (timestamp == null) return '';
-    final date = timestamp.toDate();
+  String _formatTimestamp(dynamic timestamp) {
+    final parsedTimestamp = _parseTimestamp(timestamp);
+    if (parsedTimestamp == null) return '';
+    final date = parsedTimestamp.toDate();
     return '${date.month}/${date.day}/${date.year}';
+  }
+
+  Timestamp? _parseTimestamp(dynamic value) {
+    if (value == null) return null;
+    if (value is Timestamp) return value;
+    if (value is DateTime) return Timestamp.fromDate(value);
+    if (value is String) {
+      try {
+        return Timestamp.fromDate(DateTime.parse(value));
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
   }
 
   Widget _buildAnonymousToggle(bool isMobile) {
@@ -1304,19 +1311,22 @@ class _DonationFeatureState extends State<DonationFeature>
           ),
           const SizedBox(height: 16),
           if (_selectedType == DonationType.monetary) ...[
-            _buildTextField(
-              controller: _descriptionController,
-              labelText: t('Description (Optional)', 'Description (Optional)'),
-              hintText: t(
-                'Ano ang layunin ng donasyon? Halimbawa repairs o iba pang pangangailangan ng parish',
-                'What is this donation for? e.g. repairs or other parish needs',
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: ParishColors.primaryBlue.withValues(alpha: 0.06),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: ParishColors.borderBlue100),
               ),
-              maxLines: 3,
-              prefixIcon: Icons.description,
-              validator: (value) {
-                return null;
-              },
-              isMobile: isMobile,
+              child: Text(
+                'This monetary donation is considered a general donation for the parish church and will be used to support its ministries, programs, and ongoing needs. If you wish to contribute to a specific cause, please wait for the official donation drive dedicated to that purpose.',
+                style: TextStyle(
+                  fontSize: isMobile ? 13 : 14,
+                  height: 1.45,
+                  color: ParishColors.textGray700,
+                ),
+              ),
             ),
             const SizedBox(height: 16),
           ],
@@ -1870,9 +1880,11 @@ class _DonationFeatureState extends State<DonationFeature>
                 donations.sort((a, b) {
                   final aData = a.data();
                   final bData = b.data();
-                  final aTime = aData['submittedAt'] as Timestamp?;
-                  final bTime = bData['submittedAt'] as Timestamp?;
-                  if (aTime == null || bTime == null) return 0;
+                  final aTime = _parseTimestamp(aData['submittedAt']);
+                  final bTime = _parseTimestamp(bData['submittedAt']);
+                  if (aTime == null && bTime == null) return 0;
+                  if (aTime == null) return 1;
+                  if (bTime == null) return -1;
                   return bTime.compareTo(aTime);
                 });
 
@@ -1945,7 +1957,7 @@ class _DonationFeatureState extends State<DonationFeature>
                     ),
                     ...donations.map((doc) {
                       final donation = doc.data();
-                      final submittedAt = donation['submittedAt'] as Timestamp?;
+                      final submittedAt = _parseTimestamp(donation['submittedAt']);
                       final amount =
                           (donation['amount'] as num?)?.toDouble() ?? 0.0;
                       final donationType =
@@ -2128,7 +2140,7 @@ class _DonationFeatureState extends State<DonationFeature>
               : t('Unknown', 'Unknown'));
     final donationType = donation['donationType'] as String? ?? 'unknown';
     final amount = (donation['amount'] as num?)?.toDouble() ?? 0.0;
-    final submittedAt = donation['submittedAt'] as Timestamp?;
+    final submittedAt = _parseTimestamp(donation['submittedAt']);
     final status = donation['status'] as String? ?? 'pending';
     final message = donation['message'] as String? ?? '';
     final email =

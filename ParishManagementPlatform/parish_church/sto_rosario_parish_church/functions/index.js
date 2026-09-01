@@ -14,7 +14,7 @@ const SMTP_USER = defineSecret('SMTP_USER');
 const SMTP_APP_PASSWORD = defineSecret('SMTP_APP_PASSWORD');
 const SMTP_FROM_NAME = defineSecret('SMTP_FROM_NAME');
 const GROQ_API_KEY = defineSecret('GROQ_API_KEY');
-const GROQ_CHAT_MODEL = 'llama-3.1-8b-instant';
+const GROQ_CHAT_MODEL = 'openai/gpt-oss-20b';
 
 function requireNonEmptyString(value, fieldName) {
   if (typeof value !== 'string' || value.trim().length === 0) {
@@ -2446,15 +2446,8 @@ exports.getBookingAvailability = onCall(
   }
 );
 
-const PARISH_ASSISTANT_CONTEXT = `You are the AI assistant for Sto. Rosario Parish Church in Malipampang, San Ildefonso, Bulacan.
-Use only the supplied parish context and database results. If the data is missing, say that the system does not currently have that information.
-
-Parish details:
-- Name: Sto. Rosario Parish Church, also known as Apo Sayong church
-- Location: CAGAYAN VALLEY RD., MALIPAMPANG, SAN ILDEFONSO, BULACAN 3010
-- Phone: (044) 761-1693 or 0955-042-1977
-- Email: sanjose.jaysantos@yahoo.com
-- Parish Priest: Father Jose Santos
+const PARISH_ASSISTANT_CONTEXT = `You are the AI assistant for Sto. Rosario Parish Church.
+Answer only parish-related questions using facts in the supplied database context. Do not use general knowledge, infer missing facts, or answer unrelated questions. If the requested fact is not in the database context, clearly say that no official database record is available.
 
 Privacy rules:
 - Never reveal private names, emails, phone numbers, addresses, payment methods, document links, health details, or specific booking owner details.
@@ -2462,6 +2455,16 @@ Privacy rules:
 - If a user asks for another person's records or confidential details, politely refuse.
 - Match the user's language. Use Tagalog for Tagalog questions and English for English questions.
 - Fees, requirements, and schedules must come from the whitelisted real-time database context only. Never estimate prices or invent missing requirements.`;
+
+function isParishAssistantTopic(message) {
+  return /(parish|church|sto\.?\s*rosario|apo\s*sayong|misa|mass|binyag|baptism|kumpil|confirmation|kasal|wedding|funeral|yumao|house\s*blessing|basbas|anointing|communion|komunyon|sakramento|sacrament|booking|reserve|reservation|schedule|iskedyul|available|availability|slot|fee|bayad|price|requirement|rekisito|document|dokumento|donation|abuloy|alay|announcement|anunsyo|parish priest|pari|contact|address|location|office hours)/i.test(String(message || ''));
+}
+
+function parishScopeReply(language) {
+  return language === 'tagalog'
+    ? 'Makakasagot lamang ako tungkol sa Sto. Rosario Parish at sa opisyal na impormasyong naka-record sa parish database—halimbawa, mga schedule, serbisyo, requirements, fee, booking, at anunsyo.'
+    : 'I can only help with Sto. Rosario Parish and official information recorded in the parish database, such as schedules, services, requirements, fees, bookings, and announcements.';
+}
 
 function detectAssistantLanguage(text) {
   const lower = String(text || '').toLowerCase();
@@ -2984,6 +2987,16 @@ exports.askParishAssistant = onCall(
     const rawHistory = Array.isArray(request.data?.history) ? request.data.history.slice(-8) : [];
     const language = detectAssistantLanguage(message);
     const intents = detectAssistantIntent(message);
+
+    if (!isParishAssistantTopic(message)) {
+      return {
+        reply: parishScopeReply(language),
+        intents,
+        usedRealtimeData: false,
+        answeredFromDatabase: false,
+      };
+    }
+
     const db = admin.firestore();
 
     const publicData = await getPublicParishSnapshot(db, intents, message);
@@ -3014,9 +3027,9 @@ Authenticated user: ${request.auth?.uid ? 'yes' : 'no'}
 Whitelisted real-time database context:
 ${JSON.stringify({ publicData, userData }, null, 2)}
 
-Answer naturally and concisely. Do not mention implementation details, APIs, JSON, Firestore, or database internals unless the user asks technical support staff questions.`;
+Answer naturally and concisely. Cite only facts found in the supplied database context. Never answer from general knowledge or from the conversation history. Do not mention implementation details, APIs, JSON, Firestore, or database internals unless the user asks technical support staff questions.`;
 
-    const apiKey = GROQ_API_KEY.value() || process.env.GROQ_API_KEY;
+    const apiKey = (GROQ_API_KEY.value() || process.env.GROQ_API_KEY || '').trim();
     if (!apiKey) {
       throw new HttpsError('failed-precondition', 'AI service is not configured. Please set the GROQ_API_KEY secret.');
     }

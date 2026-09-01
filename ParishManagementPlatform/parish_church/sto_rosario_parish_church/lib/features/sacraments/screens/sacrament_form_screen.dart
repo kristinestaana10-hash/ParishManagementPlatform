@@ -219,6 +219,7 @@ class _BookingAssistantResult {
 class SacramentFormData {
   final String title;
   final List<String> fields;
+  final Map<String, Map<String, dynamic>> fieldDefinitions;
   final List<String> requirements;
   final Map<String, dynamic> fees;
   final Map<String, dynamic> schedules;
@@ -229,6 +230,7 @@ class SacramentFormData {
     required this.title,
     required this.fields,
     required this.requirements,
+    this.fieldDefinitions = const {},
     this.fees = const {},
     this.schedules = const {},
     this.descriptionEnglish = '',
@@ -261,6 +263,7 @@ class SacramentFormData {
       title: (data['formName'] ?? data['title'] ?? fallback.title).toString(),
       fields: stringList(data['fields'], fallback.fields),
       requirements: stringList(data['requirements'], fallback.requirements),
+      fieldDefinitions: fallback.fieldDefinitions,
       fees: mapValue(data['fees']),
       schedules: mapValue(data['schedules']),
       descriptionEnglish:
@@ -593,11 +596,15 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   late final Map<String, TextEditingController> _controllers;
   late final Map<String, String> _dropdownValues;
   final Map<String, bool> _slotTakenCache = {};
+  final Map<String, List<String>> _availableStandardSlotsByDate = {};
+  final Set<String> _standardSlotAvailabilityLoadingDates = {};
   final Map<String, int> _bookingCountCache =
       {}; // Cache booking counts by date
   Future<void>? _bookingCountsLoadFuture;
   bool _bookingCountsLoaded = false;
   bool _isSubmitting = false;
+  bool _formDefinitionLoading = true;
+  String? _formDefinitionError;
   bool _isSundayBaptismDate = false;
   String? _sundayBaptismTime;
   bool _massScheduleLoading = false;
@@ -619,10 +626,11 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   @override
   void initState() {
     super.initState();
-    _data = SacramentFormData.forType(widget.sacramentType);
-    _controllers = {
-      for (final field in _data.fields) field: TextEditingController(),
-    };
+    // Field definitions are intentionally loaded from booking_requirements.
+    // Booking and validation rules remain in this screen; only the form
+    // definition is data-driven.
+    _data = const SacramentFormData(title: '', fields: [], requirements: []);
+    _controllers = {};
     _dropdownValues = {};
     _loadBookingFormDefinition();
     _loadUserAge();
@@ -944,6 +952,18 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     return true;
   }
 
+  bool _isSelectableMassIntentionDate(DateTime date) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final day = DateTime(date.year, date.month, date.day);
+    final maxDate = today.add(const Duration(days: 90));
+    // Mass intentions retain their existing exception to the regular
+    // two-day/Monday restrictions; the selected time is still checked against
+    // the parish Mass schedule by the booking flow.
+    return (day.isAtSameMomentAs(today) || day.isAfter(today)) &&
+        day.isBefore(maxDate);
+  }
+
   String _bookingDateKey(DateTime date) {
     return '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
   }
@@ -1027,7 +1047,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   }
 
   List<String> _selectedScheduleDateKeys() {
-    return switch (widget.sacramentType) {
+    final keys = switch (widget.sacramentType) {
       SacramentType.baptism => ['Registration - Date of Baptism'],
       SacramentType.confirmation => ['Date of Confirmation (Petsa ng Kumpil)'],
       SacramentType.wedding => ['Date of Wedding'],
@@ -1041,6 +1061,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         'First Communion Date',
       ],
     };
+    return {...keys, ..._databaseFieldKeys('date')}.toList(growable: false);
   }
 
   String _selectedScheduleTime() {
@@ -1059,6 +1080,8 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       ],
     };
 
+    keys.addAll(_databaseFieldKeys('time'));
+
     for (final key in keys) {
       final value = _controllers[key]?.text.trim() ?? '';
       if (value.isNotEmpty) return value;
@@ -1068,7 +1091,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   }
 
   List<String> _selectedScheduleTimeKeys() {
-    return switch (widget.sacramentType) {
+    final keys = switch (widget.sacramentType) {
       SacramentType.baptism => ['Registration - Time of Baptism'],
       SacramentType.confirmation => ['Time (Oras)'],
       SacramentType.wedding => ['Time'],
@@ -1082,6 +1105,17 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         'First Communion Time',
       ],
     };
+    return {...keys, ..._databaseFieldKeys('time')}.toList(growable: false);
+  }
+
+  List<String> _databaseFieldKeys(String fieldType) {
+    return _data.fields.where((field) {
+      final type = (_data.fieldDefinitions[field]?['type'] ?? '')
+          .toString()
+          .toLowerCase();
+      final normalized = field.toLowerCase();
+      return type == fieldType || normalized.contains(fieldType);
+    }).toList(growable: false);
   }
 
   void _clearSelectedScheduleTime() {
@@ -1091,19 +1125,78 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   }
 
   Future<void> _loadBookingFormDefinition() async {
-    final data = await FirebaseService.instance.getBookingFormDefinition(
-      widget.sacramentType.bookingFormKey,
-    );
-    if (!mounted || data == null) return;
+    try {
+      final data = await FirebaseService.instance.getBookingFormDefinition(
+        widget.sacramentType.bookingFormKey,
+      );
+      if (!mounted) return;
+      if (data == null) {
+        setState(() {
+          _formDefinitionLoading = false;
+          _formDefinitionError = 'No booking form definition was found.';
+        });
+        return;
+      }
 
-    var nextData = SacramentFormData.fromDatabase(data, _data);
-    if (nextData.fields.isEmpty) return;
+      final rawFields = data['formFields'] ?? data['fields'];
+      if (rawFields is! List) {
+        setState(() {
+          _formDefinitionLoading = false;
+          _formDefinitionError = 'The booking form has no fields configured.';
+        });
+        return;
+      }
+
+      final fields = <String>[];
+      final fieldDefinitions = <String, Map<String, dynamic>>{};
+      for (final rawField in rawFields) {
+        if (rawField is Map) {
+          final definition = Map<String, dynamic>.from(rawField);
+          if (definition['visible'] == false) continue;
+          final name = (definition['name'] ??
+                  definition['key'] ??
+                  definition['label'] ??
+                  '')
+              .toString()
+              .trim();
+          if (name.isEmpty) continue;
+          fields.add(name);
+          fieldDefinitions[name] = definition;
+        } else {
+          final name = rawField?.toString().trim() ?? '';
+          if (name.isNotEmpty) fields.add(name);
+        }
+      }
+
+      var nextData = SacramentFormData.fromDatabase(data, _data);
+      // Do not fall back to application-defined fields. An empty list is a
+      // valid database-controlled form definition.
+      nextData = SacramentFormData(
+        title: nextData.title,
+        fields: fields,
+        fieldDefinitions: fieldDefinitions,
+        requirements: (data['requirements'] ??
+                    data['requiredDocuments'] ??
+                    data['documents']) is List
+            ? ((data['requirements'] ??
+                        data['requiredDocuments'] ??
+                        data['documents']) as List)
+                  .map((item) => item?.toString().trim() ?? '')
+                  .where((item) => item.isNotEmpty)
+                  .toList(growable: false)
+            : const [],
+        fees: nextData.fees,
+        schedules: nextData.schedules,
+        descriptionEnglish: nextData.descriptionEnglish,
+        descriptionTagalog: nextData.descriptionTagalog,
+      );
     if (widget.sacramentType == SacramentType.massIntention) {
       nextData = SacramentFormData(
         title: nextData.title,
         fields: nextData.fields
             .where((field) => !_isDonationArNumberField(field))
             .toList(growable: false),
+        fieldDefinitions: nextData.fieldDefinitions,
         requirements: nextData.requirements,
         fees: nextData.fees,
         schedules: nextData.schedules,
@@ -1114,6 +1207,8 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
 
     setState(() {
       _data = nextData;
+      _formDefinitionLoading = false;
+      _formDefinitionError = null;
       final activeFields = _data.fields.toSet();
       final removedFields = _controllers.keys
           .where((field) => !activeFields.contains(field))
@@ -1125,6 +1220,15 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         _controllers.putIfAbsent(field, TextEditingController.new);
       }
     });
+    } catch (error) {
+      debugPrint('Failed to load booking form definition: $error');
+      if (mounted) {
+        setState(() {
+          _formDefinitionLoading = false;
+          _formDefinitionError = 'Unable to load the booking form.';
+        });
+      }
+    }
   }
 
   Future<bool> _isBlockedByMassSchedule({
@@ -1279,13 +1383,15 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             _validationResults[requirementIndex] = validationResult;
           });
 
-          _showModalNotificationGlobal(
-            context,
-            widget.isTagalog
-                ? 'Matagumpay na na-upload!'
-                : 'Successfully uploaded!',
-            bgColor: ParishColors.greenSuccess,
-          );
+          if (!_applyAndReviewOcrData(validationResult, requirementIndex)) {
+            _showModalNotificationGlobal(
+              context,
+              widget.isTagalog
+                  ? 'Matagumpay na na-upload!'
+                  : 'Successfully uploaded!',
+              bgColor: ParishColors.greenSuccess,
+            );
+          }
         } else {
           // BLOCKING: Score < 30% or critical errors - block upload completely
           _showValidationFailureDialog(validationResult, requirementIndex);
@@ -1313,16 +1419,28 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     DocumentValidationResult result,
     int requirementIndex,
   ) {
+    final serviceUnavailable = result.missingFields.contains(
+      'document_verification_service',
+    );
     showDialog(
       context: context,
       builder: (BuildContext context) {
         return AlertDialog(
           title: Row(
             children: [
-              const Icon(Icons.error, color: Colors.red),
+              Icon(
+                serviceUnavailable ? Icons.cloud_off : Icons.error,
+                color: Colors.red,
+              ),
               const SizedBox(width: 8),
               Text(
-                widget.isTagalog ? 'Di Validong Dokumento' : 'Invalid Document',
+                serviceUnavailable
+                    ? (widget.isTagalog
+                          ? 'Hindi Available ang Pag-verify'
+                          : 'Document Verification Unavailable')
+                    : (widget.isTagalog
+                          ? 'Di Validong Dokumento'
+                          : 'Invalid Document'),
                 style: const TextStyle(color: Colors.red),
               ),
             ],
@@ -1333,9 +1451,13 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  widget.isTagalog
-                      ? 'Hindi namin makilalang mabuti ang dokumentong ito.'
-                      : 'We could not recognize this document.',
+                    serviceUnavailable
+                        ? (widget.isTagalog
+                              ? 'Hindi napatunayan ang dokumento dahil hindi available ang verification service.'
+                              : 'The document was not verified because the verification service is unavailable.')
+                        : (widget.isTagalog
+                              ? 'Hindi namin makilalang mabuti ang dokumentong ito.'
+                              : 'We could not recognize this document.'),
                   style: const TextStyle(fontWeight: FontWeight.w500),
                 ),
                 const SizedBox(height: 16),
@@ -1347,9 +1469,13 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                   const SizedBox(height: 16),
                 ],
                 Text(
-                  widget.isTagalog
-                      ? 'Subukan muli gamit ang malinaw at kumpletong dokumento.'
-                      : 'Please try again with a clear and complete document.',
+                  serviceUnavailable
+                      ? (widget.isTagalog
+                            ? 'Subukan muli kapag naibalik na ng administrator ang verification service.'
+                            : 'Please try again after an administrator restores the verification service.')
+                      : (widget.isTagalog
+                            ? 'Subukan muli gamit ang malinaw at kumpletong dokumento.'
+                            : 'Please try again with a clear and complete document.'),
                   style: const TextStyle(fontStyle: FontStyle.italic),
                 ),
               ],
@@ -2322,18 +2448,40 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     bool required = true,
     List<TimeOfDay>? allowedTimes,
     bool disabled = false,
+    bool dropdownOnly = false,
   }) {
     final fieldKey = key ?? label;
     _controllers.putIfAbsent(fieldKey, () => TextEditingController());
 
-    if (allowedTimes != null && allowedTimes.isNotEmpty) {
-      final allowedValues = allowedTimes.map(_formatTimeOfDay).toList();
+    // Mass Intention retains its existing Mass-schedule exception. All other
+    // parish services and sacraments use the shared date-specific slots.
+    final usesStandardBookingSlots =
+        widget.sacramentType != SacramentType.massIntention;
+    final selectedDate = _selectedScheduleDate();
+    final baseAllowedTimes = allowedTimes ??
+        (usesStandardBookingSlots ? _standardBookingTimeSlots() : null);
+    final availableStandardSlots = selectedDate.isEmpty
+        ? const <String>[]
+        : _availableStandardSlotsByDate[selectedDate] ?? const <String>[];
+    final effectiveAllowedTimes = !usesStandardBookingSlots || baseAllowedTimes == null
+        ? baseAllowedTimes
+        : baseAllowedTimes
+            .where(
+              (time) => availableStandardSlots.contains(_formatTimeOfDay(time)),
+            )
+            .toList(growable: false);
+    final availabilityLoading = usesStandardBookingSlots &&
+        selectedDate.isNotEmpty &&
+        _standardSlotAvailabilityLoadingDates.contains(selectedDate);
+
+    if (dropdownOnly || effectiveAllowedTimes != null) {
+      final allowedValues = (effectiveAllowedTimes ?? const <TimeOfDay>[])
+          .map(_formatTimeOfDay)
+          .toList();
       final currentValue = _controllers[fieldKey]!.text;
-      final selectedValue = allowedValues.contains(currentValue)
-          ? currentValue
-          : allowedValues.first;
+      final selectedValue = allowedValues.contains(currentValue) ? currentValue : null;
       if (_controllers[fieldKey]!.text != selectedValue) {
-        _controllers[fieldKey]!.text = selectedValue;
+        _controllers[fieldKey]!.text = selectedValue ?? '';
       }
       return Padding(
         padding: const EdgeInsets.symmetric(vertical: 6.0),
@@ -2342,11 +2490,26 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             labelText: label,
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
           ),
-          initialValue: selectedValue,
+          value: selectedValue,
+          hint: Text(
+            allowedValues.isEmpty
+                ? (selectedDate.isEmpty
+                    ? (widget.isTagalog
+                        ? 'Pumili muna ng petsa'
+                        : 'Select a date first')
+                    : availabilityLoading
+                    ? (widget.isTagalog
+                        ? 'Sinusuri ang available na oras...'
+                        : 'Checking available times...')
+                    : (widget.isTagalog
+                        ? 'Wala nang available na oras'
+                        : 'No times are available'))
+                : (widget.isTagalog ? 'Pumili ng oras' : 'Select a time'),
+          ),
           items: allowedValues.map((option) {
             return DropdownMenuItem<String>(value: option, child: Text(option));
           }).toList(),
-          onChanged: disabled
+          onChanged: disabled || allowedValues.isEmpty
               ? null
               : (value) async {
                   if (value == null) return;
@@ -3788,8 +3951,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   }
 
   List<TimeOfDay> _massIntentionAllowedTimesForSelectedDate() {
-    final dateValue =
-        _controllers['Date of Mass (Petsa ng Misa)']?.text.trim() ?? '';
+    final dateValue = _selectedScheduleDate();
     final parsedDate = DateTime.tryParse(dateValue);
     if (parsedDate == null || _massScheduleTexts.isEmpty) return [];
 
@@ -3955,6 +4117,9 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         timeKeys = ['Time of First Communion', 'First Communion Time'];
         break;
     }
+
+    dateKeys.addAll(_databaseFieldKeys('date'));
+    timeKeys.addAll(_databaseFieldKeys('time'));
 
     // Find date and time field values
     for (final key in dateKeys) {
@@ -4243,6 +4408,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                     ? (sundayTime ?? '')
                     : '');
               });
+              await _refreshStandardSlotAvailability(selectedDate);
               // Check for scheduling conflicts after date is selected
               await _checkSchedulingConflictOnSelection();
             } else {
@@ -4261,6 +4427,9 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                   _controllers['Time of Mass (Oras ng Misa)']?.clear();
                 }
               });
+              if (_selectedScheduleDateKeys().contains(fieldKey)) {
+                await _refreshStandardSlotAvailability(selectedDate);
+              }
               // Check for scheduling conflicts after date is selected
               await _checkSchedulingConflictOnSelection();
             }
@@ -4595,9 +4764,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Hide requirements title for First Communion (no requirements)
-                      if (widget.sacramentType !=
-                          SacramentType.firstCommunion) ...[
+                      if (_data.requirements.isNotEmpty) ...[
                         Text(
                           isTagalog
                               ? 'Mga Kinakailangang Dokumento / Requirements'
@@ -4634,66 +4801,30 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                           }),
                         const SizedBox(height: 18),
                       ],
-                      if (widget.sacramentType == SacramentType.baptism)
-                        _buildDetailedBaptismForm(isTagalog)
-                      else if (widget.sacramentType == SacramentType.funeral)
-                        _buildDetailedFuneralForm(isTagalog)
-                      else if (widget.sacramentType == SacramentType.wedding)
-                        _buildDetailedWeddingForm(isTagalog)
-                      else if (widget.sacramentType ==
-                          SacramentType.confirmation)
-                        _buildDetailedConfirmationForm(isTagalog)
-                      else if (widget.sacramentType ==
-                          SacramentType.houseBlessing)
-                        _buildDetailedHouseBlessingForm(isTagalog)
-                      else if (widget.sacramentType == SacramentType.anointing)
-                        _buildDetailedAnointingForm(isTagalog)
-                      else if (widget.sacramentType ==
-                          SacramentType.massIntention)
-                        _buildDetailedMassIntentionForm(isTagalog)
-                      else if (widget.sacramentType ==
-                          SacramentType.firstCommunion)
-                        _buildDetailedFirstCommunionForm(isTagalog)
+                      if (_formDefinitionLoading)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 32),
+                          child: Center(child: CircularProgressIndicator()),
+                        )
+                      else if (_formDefinitionError != null)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 20),
+                          child: Text(
+                            _formDefinitionError!,
+                            style: const TextStyle(color: Colors.red),
+                          ),
+                        )
                       else
-                        Column(
-                          children: _data.fields.map((field) {
-                            // Check if this is a section header
-                            if (field.startsWith('[SECTION]')) {
-                              final sectionTitle = field.replaceFirst(
-                                '[SECTION] ',
-                                '',
-                              );
-                              return _buildSectionHeader(sectionTitle);
-                            }
-                            return Padding(
-                              padding: const EdgeInsets.symmetric(
-                                vertical: 6.0,
-                              ),
-                              child: TextFormField(
-                                controller: _controllers[field],
-                                decoration: InputDecoration(
-                                  labelText: field,
-                                  border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                ),
-                                validator: (value) {
-                                  if (value == null || value.isEmpty) {
-                                    return isTagalog
-                                        ? 'Pakitiyak na punuin ang $field'
-                                        : 'Please fill in $field';
-                                  }
-                                  return null;
-                                },
-                              ),
-                            );
-                          }).toList(),
-                        ),
+                        _buildDatabaseDrivenForm(isTagalog),
                       const SizedBox(height: 20),
                       SizedBox(
                         width: double.infinity,
                         child: ElevatedButton(
-                          onPressed: _isSubmitting ? null : _submitForm,
+                          onPressed: _isSubmitting ||
+                                  _formDefinitionLoading ||
+                                  _formDefinitionError != null
+                              ? null
+                              : _submitForm,
                           style: ElevatedButton.styleFrom(
                             padding: const EdgeInsets.all(14.0),
                             shape: RoundedRectangleBorder(
@@ -4741,6 +4872,327 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         ),
       ),
     );
+  }
+
+  /// Builds every user-visible form control from `booking_requirements.fields`.
+  /// The field names remain the submission keys, so existing booking, schedule,
+  /// eligibility, and document-validation processes continue to use them.
+  Widget _buildDatabaseDrivenForm(bool isTagalog) {
+    final sections = <String, List<Widget>>{};
+    var activeSection = isTagalog ? 'IMPORMASYON NG FORM' : 'FORM INFORMATION';
+
+    for (final field in _data.fields) {
+      if (field.startsWith('[SECTION]')) {
+        final section = field.replaceFirst('[SECTION]', '').trim();
+        if (section.isNotEmpty) activeSection = section;
+        continue;
+      }
+
+      final definition = _data.fieldDefinitions[field] ?? const {};
+      final section = (definition['section'] ?? '').toString().trim();
+      if (section.isNotEmpty) activeSection = section;
+      sections
+          .putIfAbsent(activeSection, () => <Widget>[])
+          .add(_buildDatabaseField(field, definition));
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: sections.entries
+          .map(
+            (entry) => _buildDatabaseSection(
+              title: entry.key,
+              fields: entry.value,
+            ),
+          )
+          .toList(growable: false),
+    );
+  }
+
+  /// Applies only empty booking fields, so an upload never replaces details the
+  /// user has already typed.  The visible review dialog makes the automatic
+  /// fill transparent before the booking can be submitted.
+  bool _applyAndReviewOcrData(
+    DocumentValidationResult result,
+    int requirementIndex,
+  ) {
+    final data = result.extractedData;
+    final applied = <String, String>{};
+
+    String value(String key) => (data[key] ?? '').toString().trim();
+
+    String? findField(bool Function(String normalized) matches) {
+      for (final key in _controllers.keys) {
+        if (matches(key.toLowerCase())) return key;
+      }
+      return null;
+    }
+
+    void apply(String extractedKey, bool Function(String normalized) matches) {
+      final extracted = value(extractedKey);
+      if (extracted.isEmpty) return;
+      final key = findField(matches);
+      if (key == null) return;
+      final controller = _controllers[key];
+      if (controller != null && controller.text.trim().isEmpty) {
+        controller.text = extracted;
+        applied[key] = extracted;
+      }
+    }
+
+    // The exclusions keep a child's details out of parent, godparent, and
+    // contact-name fields even when a parish uses custom field labels.
+    apply('full_name', (field) =>
+        (field.contains('name') || field.contains('pangalan')) &&
+        !field.contains('father') &&
+        !field.contains('mother') &&
+        !field.contains('ama') &&
+        !field.contains('ina') &&
+        !field.contains('godparent') &&
+        !field.contains('ninong') &&
+        !field.contains('ninang') &&
+        !field.contains('contact'));
+    apply('date_of_birth',
+        (field) =>
+            (field.contains('date') || field.contains('petsa')) &&
+            (field.contains('birth') || field.contains('kapanganakan')));
+    apply('place_of_birth',
+        (field) =>
+            (field.contains('place') || field.contains('lugar')) &&
+            (field.contains('birth') || field.contains('kapanganakan')));
+    apply('father_name',
+        (field) =>
+            (field.contains('father') || field.contains('ama')) &&
+            (field.contains('name') || field.contains('pangalan')));
+    apply('mother_name',
+        (field) =>
+            (field.contains('mother') || field.contains('ina')) &&
+            (field.contains('name') || field.contains('pangalan')));
+
+    if (applied.isEmpty || !mounted) return false;
+    setState(() {});
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(widget.isTagalog ? 'Suriin ang na-extract na detalye' : 'Review extracted details'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.isTagalog
+                    ? 'Napunan ang mga sumusunod na bakanteng field mula sa ${_data.requirements[requirementIndex]}. Maaari mo pa itong baguhin sa form bago isumite.'
+                    : 'The following empty fields were filled from ${_data.requirements[requirementIndex]}. You can still edit them in the form before submitting.',
+              ),
+              const SizedBox(height: 12),
+              ...applied.entries.map(
+                (entry) => Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text('${entry.key}: ${entry.value}'),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: Text(widget.isTagalog ? 'Suriin ang Form' : 'Review Form'),
+          ),
+        ],
+      ),
+    );
+    return true;
+  }
+
+  List<TimeOfDay> _standardBookingTimeSlots() {
+    // Two morning sessions and two afternoon sessions, beginning at 1:00 PM.
+    return const [
+      TimeOfDay(hour: 8, minute: 0),
+      TimeOfDay(hour: 9, minute: 30),
+      TimeOfDay(hour: 13, minute: 0),
+      TimeOfDay(hour: 14, minute: 30),
+    ];
+  }
+
+  Future<void> _refreshStandardSlotAvailability(String date) async {
+    if (widget.sacramentType == SacramentType.massIntention ||
+        date.isEmpty ||
+        _standardSlotAvailabilityLoadingDates.contains(date)) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _standardSlotAvailabilityLoadingDates.add(date);
+      });
+    } else {
+      _standardSlotAvailabilityLoadingDates.add(date);
+    }
+    final allSlots = _standardBookingTimeSlots().map(_formatTimeOfDay).toList();
+    try {
+      final availableSlots = await FirebaseService.instance.getAvailableTimeSlots(
+        date: date,
+        allPossibleTimeSlots: allSlots,
+      );
+      if (!mounted || _selectedScheduleDate() != date) return;
+
+      setState(() {
+        _availableStandardSlotsByDate[date] = availableSlots;
+        final selectedTime = _selectedScheduleTime();
+        if (selectedTime.isNotEmpty && !availableSlots.contains(selectedTime)) {
+          _clearSelectedScheduleTime();
+        }
+      });
+    } catch (e) {
+      debugPrint('[BOOKING SLOTS] Could not load availability for $date: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _standardSlotAvailabilityLoadingDates.remove(date);
+        });
+      } else {
+        _standardSlotAvailabilityLoadingDates.remove(date);
+      }
+    }
+  }
+
+  Widget _buildDatabaseSection({
+    required String title,
+    required List<Widget> fields,
+  }) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 18),
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: ParishColors.textBlue900.withValues(alpha: 0.12)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.assignment_outlined, color: ParishColors.textBlue900),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w700,
+                      color: ParishColors.textBlue900,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const Divider(height: 24),
+            ...fields,
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDatabaseField(
+    String field,
+    Map<String, dynamic> definition,
+  ) {
+    final normalized = field.toLowerCase();
+    final fieldType = (definition['type'] ?? '').toString().toLowerCase();
+    final isOptional = definition['required'] is bool
+        ? !(definition['required'] as bool)
+        : normalized.contains('optional') || field.endsWith('?');
+    final required = !isOptional;
+    final label = (definition['label'] ?? field)
+        .toString()
+        .replaceAll(RegExp(r'\s*\*\s*$'), '')
+        .replaceAll(RegExp(r'\s*\?\s*$'), '')
+        .replaceAll(RegExp(r'\s*\(optional\)\s*', caseSensitive: false), '')
+        .trim();
+
+    if (fieldType == 'date' || normalized.contains('date')) {
+          final isBirthDate = normalized.contains('birth') ||
+              normalized.contains('kapanganakan');
+          return _buildDateField(
+            label,
+            key: field,
+            required: required,
+            isBirthday: isBirthDate,
+            selectableDayPredicate: isBirthDate
+                ? null
+                : widget.sacramentType == SacramentType.firstCommunion
+                ? (date) => _isSelectableFlexibleRangeBookingDate(date, 365)
+                : widget.sacramentType == SacramentType.massIntention
+                ? _isSelectableMassIntentionDate
+                : _isSelectableSameDayAmPmBookingDate,
+          );
+    }
+    if (fieldType == 'time' ||
+        normalized.contains('time') ||
+        normalized.contains('oras')) {
+      final isMassIntention = widget.sacramentType == SacramentType.massIntention;
+      return _buildTimeField(
+        label,
+        key: field,
+        required: required,
+        allowedTimes: isMassIntention
+            ? _massIntentionAllowedTimesForSelectedDate()
+            : _standardBookingTimeSlots(),
+        disabled: isMassIntention && _selectedScheduleDate().isEmpty,
+        dropdownOnly: true,
+      );
+    }
+    if (fieldType == 'phone' ||
+            fieldType == 'tel' ||
+            normalized.contains('contact') ||
+            normalized.contains('phone') ||
+            normalized.contains('cell') ||
+            normalized.contains('tel.')) {
+          return _buildPhilippinePhoneField(label, key: field, required: required);
+    }
+    if (fieldType == 'number' ||
+            normalized.contains('age') ||
+            normalized.contains('edad')) {
+          final minAge = normalized.contains('ninong') || normalized.contains('ninang')
+              ? 18
+              : (widget.sacramentType == SacramentType.wedding &&
+                        (normalized.contains('groom') || normalized.contains('bride'))
+                    ? 21
+                    : 0);
+          return _buildNumberField(
+            label,
+            key: field,
+            min: minAge,
+            required: required,
+          );
+    }
+    final configuredOptions = definition['options'] is List
+            ? (definition['options'] as List)
+                  .map((option) => option.toString())
+                  .where((option) => option.isNotEmpty)
+                  .toList(growable: false)
+            : const <String>[];
+    if ((fieldType == 'select' || fieldType == 'dropdown') &&
+            configuredOptions.isNotEmpty) {
+          return _buildDropdownField(label, configuredOptions,
+              key: field, required: required);
+    }
+    if (normalized.contains('gender') || normalized.contains('kasarian')) {
+          return _buildDropdownField(label, const ['Male', 'Female'],
+              key: field, required: required);
+    }
+    if (normalized.contains('marriage status') ||
+            normalized.endsWith(' status') ||
+            normalized.contains('civil status')) {
+          return _buildDropdownField(label, const ['Single', 'Married', 'Widowed', 'Annulled'],
+              key: field, required: required);
+    }
+    return _buildTextField(label, key: field, required: required);
   }
 
   Widget _buildDetailedBaptismForm(bool isTagalog) {

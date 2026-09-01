@@ -6,6 +6,7 @@ class ParishSidebarDrawer extends StatelessWidget {
   final VoidCallback onAboutParishPressed;
   final VoidCallback onMassSchedulePressed;
   final VoidCallback onAnnouncementsPressed;
+  final VoidCallback onDonationDrivesPressed;
   final VoidCallback onDonatePressed;
   final VoidCallback onContactPressed;
   final VoidCallback? onSignInPressed;
@@ -16,6 +17,7 @@ class ParishSidebarDrawer extends StatelessWidget {
     required this.onAboutParishPressed,
     required this.onMassSchedulePressed,
     required this.onAnnouncementsPressed,
+    required this.onDonationDrivesPressed,
     required this.onDonatePressed,
     required this.onContactPressed,
     this.onSignInPressed,
@@ -112,6 +114,13 @@ class ParishSidebarDrawer extends StatelessWidget {
                   'Announcements',
                   'Mga Anunsyo',
                   onAnnouncementsPressed,
+                ),
+                _buildMenuItem(
+                  context,
+                  Icons.volunteer_activism,
+                  'Donation Drives',
+                  'Mga Donasyon',
+                  onDonationDrivesPressed,
                 ),
                 _buildMenuItem(
                   context,

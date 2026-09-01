@@ -13,6 +13,16 @@ service cloud.firestore {
       );
     }
 
+    function isOpenDonationDrive(driveId, donationType) {
+      let drivePath = /databases/$(database)/documents/donation_drives/$(driveId);
+      let drive = get(drivePath);
+      return exists(drivePath) &&
+          drive.data.status in ['active', 'open', 'ongoing', 'published'] &&
+          (!drive.data.keys().hasAll(['endDate']) || drive.data.endDate >= request.time) &&
+          (!drive.data.keys().hasAll(['allowedDonationTypes']) ||
+              drive.data.allowedDonationTypes.hasAny([donationType]));
+    }
+
     function isStringMap(m) {
       return m is map && m.size() <= 400 && m.values().all(v, v is string);
     }
@@ -269,6 +279,91 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // Donation drives: public read so the app (including guests) can list drives
+    match /donation_drives/{driveId} {
+      allow read: if true;
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // Donation submissions: allow creation by authenticated users (userUid must match)
+    // or by guests submitting with an empty userUid. Donation contact details are
+    // private, so only the owner and admins may read them.
+    match /donation_submissions/{submissionId} {
+      allow create: if request.resource.data.keys().hasAll([
+            'driveId', 'driveTitle', 'donationType', 'isAnonymous', 'userUid',
+            'createdAt', 'name', 'email', 'phone'
+          ]) &&
+          request.resource.data.driveId is string &&
+          request.resource.data.driveTitle is string &&
+          request.resource.data.donationType in [
+            'Monetary', 'In-Kind', 'Other Support'
+          ] &&
+          request.resource.data.isAnonymous is bool &&
+          request.resource.data.userUid is string &&
+          request.resource.data.createdAt == request.time &&
+          request.resource.data.name is string &&
+          request.resource.data.email is string &&
+          request.resource.data.phone is string &&
+          request.resource.data.name.size() <= 150 &&
+          request.resource.data.email.size() <= 254 &&
+          request.resource.data.phone.size() <= 40 &&
+          (!request.resource.data.isAnonymous ||
+              (request.resource.data.name == 'Anonymous' &&
+               request.resource.data.email == '' &&
+               request.resource.data.phone == '')) &&
+          isOpenDonationDrive(
+            request.resource.data.driveId,
+            request.resource.data.donationType
+          ) &&
+          (
+            (isSignedIn() && request.resource.data.userUid == request.auth.uid) ||
+            (!isSignedIn() && request.resource.data.userUid == '')
+          ) &&
+          (
+            request.resource.data.donationType == 'Monetary' &&
+            request.resource.data.keys().hasOnly([
+              'driveId', 'driveTitle', 'donationType', 'isAnonymous', 'userUid',
+              'createdAt', 'name', 'email', 'phone', 'amount'
+            ]) &&
+            request.resource.data.amount is number &&
+            request.resource.data.amount > 0 && request.resource.data.amount <= 1000000
+          ||
+            request.resource.data.donationType == 'In-Kind' &&
+            request.resource.data.keys().hasOnly([
+              'driveId', 'driveTitle', 'donationType', 'isAnonymous', 'userUid',
+              'createdAt', 'name', 'email', 'phone', 'item', 'quantity',
+              'condition', 'deliveryMethod'
+            ]) &&
+            request.resource.data.item is string &&
+            request.resource.data.quantity is string &&
+            request.resource.data.condition is string &&
+            request.resource.data.deliveryMethod is string &&
+            request.resource.data.item.size() > 0 &&
+            request.resource.data.quantity.size() > 0 &&
+            request.resource.data.item.size() <= 300 &&
+            request.resource.data.quantity.size() <= 100 &&
+            request.resource.data.condition.size() <= 1000 &&
+            request.resource.data.deliveryMethod.size() <= 300
+          ||
+            request.resource.data.donationType == 'Other Support' &&
+            request.resource.data.keys().hasOnly([
+              'driveId', 'driveTitle', 'donationType', 'isAnonymous', 'userUid',
+              'createdAt', 'name', 'email', 'phone', 'details'
+            ]) &&
+            request.resource.data.details is string &&
+            request.resource.data.details.size() > 0 &&
+            request.resource.data.details.size() <= 2000
+          );
+
+      allow read: if isSignedIn() &&
+          (resource.data.userUid == request.auth.uid || isAdmin());
+
+      // Commitments are immutable for donors. Only parish administrators may
+      // add follow-up information or change their status.
+      allow update: if isSignedIn() && isAdmin();
+      allow delete: if false;
+    }
+
     // Counters collection for structured ID generation
     match /counters/{counterId} {
       allow read, write: if isSignedIn();
@@ -303,6 +398,13 @@ service cloud.firestore {
     // Booking form definitions for sacrament/service content.
     // Public read keeps the booking flow available to guests/readers; only
     // admins may manage content.
+    match /booking_requirements/{formId} {
+      allow read: if true;
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // Legacy source for existing form definitions. This can be removed after
+    // all documents have been migrated to booking_requirements.
     match /booking_forms/{formId} {
       allow read: if true;
       allow create, update, delete: if isSignedIn() && isAdmin();

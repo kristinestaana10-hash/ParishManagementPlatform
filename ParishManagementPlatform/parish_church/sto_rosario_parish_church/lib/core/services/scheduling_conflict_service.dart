@@ -727,12 +727,12 @@ class SchedulingConflictService {
     try {
       final bookings = await getBookingsForDate(date);
       final bookedTimes = bookings
-          .map((b) => b.time.toLowerCase().trim())
+          .map((b) => _timeSlotKey(b.time))
           .where((t) => t.isNotEmpty)
           .toSet();
 
       return allPossibleTimeSlots
-          .where((slot) => !bookedTimes.contains(slot.toLowerCase().trim()))
+          .where((slot) => !bookedTimes.contains(_timeSlotKey(slot)))
           .toList();
     } catch (e) {
       debugPrint(
@@ -740,5 +740,11 @@ class SchedulingConflictService {
       );
       return allPossibleTimeSlots;
     }
+  }
+
+  /// Treat display variants such as `08:00 AM` and `8:00 AM` as one slot.
+  String _timeSlotKey(String time) {
+    final minutes = _parseTimeToMinutes(time);
+    return minutes?.toString() ?? time.toLowerCase().trim();
   }
 }

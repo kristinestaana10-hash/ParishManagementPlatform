@@ -19,6 +19,7 @@ import '../features/profile/screens/profile_screen.dart';
 import '../features/history/screens/church_history_screen.dart';
 import '../features/masses/screens/mass_schedule_screen.dart';
 import '../features/donations/screens/donation_feature.dart';
+import '../features/donations/screens/donation_drives_screen.dart';
 import '../features/contact/screens/contact_screen.dart';
 import '../features/announcements/screens/announcements_screen.dart';
 
@@ -155,6 +156,7 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
               onAboutParishPressed: _navigateToAboutParish,
               onMassSchedulePressed: _navigateToMassSchedule,
               onAnnouncementsPressed: _navigateToAnnouncements,
+              onDonationDrivesPressed: _navigateToDonationDrives,
               onDonatePressed: _navigateToDonate,
               onContactPressed: _navigateToContact,
               onSignInPressed: _showAuthDialog,
@@ -639,6 +641,19 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
       MaterialPageRoute(
         builder: (context) =>
             DonationFeature(isTagalog: _isLanguageTagalog, isGuest: _isGuest),
+      ),
+    );
+  }
+
+  void _navigateToDonationDrives() {
+    // Close the drawer
+    _scaffoldKey.currentState?.closeDrawer();
+
+    // Navigate to the Donation Drives list
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => DonationDrivesScreen(isTagalog: _isLanguageTagalog),
       ),
     );
   }

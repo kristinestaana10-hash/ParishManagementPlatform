@@ -41,7 +41,11 @@ class _DocumentOcrResult {
     required this.qualityData,
   });
 
-  bool get hasBlockingQualityIssues => qualityIssues.isNotEmpty;
+  // Low resolution and edge-text signals are useful warnings, but they are not
+  // reliable enough to reject an otherwise readable, correctly identified
+  // civil document.  Missing readable text remains a hard stop.
+  bool get hasBlockingQualityIssues =>
+      qualityIssues.contains('insufficient_readable_text');
 }
 
 /// Validation rules for different sacrament types
@@ -259,7 +263,10 @@ class DocumentValidationService {
       final extractedText = ocrResult.text;
       print('DEBUG: Extracted text from document: $extractedText');
 
-      if (ocrResult.hasBlockingQualityIssues) {
+      // OCR geometry/confidence can be incomplete for a valid scan.  Only use
+      // this gate when no readable OCR text was recovered; otherwise document
+      // identity is decided by the evidence check below.
+      if (ocrResult.hasBlockingQualityIssues && extractedText.trim().isEmpty) {
         print('DEBUG: Blocking document due to image quality issues');
         print('DEBUG: Quality issues: ${ocrResult.qualityIssues}');
 
@@ -303,6 +310,40 @@ class DocumentValidationService {
       if (extractedText.isEmpty) {
         print('DEBUG: OCR failed - extractedText is empty');
         print('DEBUG: Using fallback validation with basic checks');
+
+        final apiReason = ocrResult.qualityData['ocr_api_reason']?.toString();
+        if (apiReason != null && apiReason.isNotEmpty) {
+          final apiMessage = ocrResult.qualityData['ocr_api_error']?.toString();
+          final serviceMessage = apiReason == 'BILLING_DISABLED'
+              ? 'Document verification is temporarily unavailable because Google Cloud Vision billing is disabled for this project. This file was not rejected as invalid; an administrator must enable billing for the Vision API project and try again.'
+              : apiReason == 'SERVICE_DISABLED'
+              ? 'Document verification is temporarily unavailable because the Google Cloud Vision API is disabled for this project. This file was not rejected as invalid; an administrator must enable the API and try again.'
+              : apiReason == 'API_KEY_INVALID' || apiReason == 'API_KEY_SERVICE_BLOCKED'
+              ? 'Document verification is temporarily unavailable because its API key is invalid or blocked. This file was not rejected as invalid; an administrator must update the Vision API configuration and try again.'
+              : 'Document verification is temporarily unavailable. This file was not rejected as invalid. ${apiMessage ?? 'Please try again later.'}';
+          return DocumentValidationResult(
+            isValid: false,
+            missingFields: const ['document_verification_service'],
+            invalidFields: const [],
+            warnings: const [],
+            confidenceScore: 0.0,
+            extractedData: ocrResult.qualityData,
+            errorMessage: serviceMessage,
+          );
+        }
+
+        if (ocrResult.qualityData['ocr_unsupported_format'] == true) {
+          return DocumentValidationResult(
+            isValid: false,
+            missingFields: ['ocr_supported_format'],
+            invalidFields: ['unsupported_ocr_format'],
+            warnings: ocrResult.warnings,
+            confidenceScore: 0.0,
+            extractedData: ocrResult.qualityData,
+            errorMessage:
+                'This Word document cannot be verified directly. Please upload the original as a PDF or a clear JPG/PNG scan.',
+          );
+        }
 
         // BASIC FALLBACK VALIDATION - Check file properties
         final isValidFile = _validateFileBasics(documentFile);
@@ -517,6 +558,9 @@ class DocumentValidationService {
     if (config.displayName == 'Baptismal Certificate') {
       return _validateBaptismalCertificateTemplate(extractedText, config);
     }
+    if (config.displayName == 'Birth Certificate') {
+      return _validateBirthCertificate(extractedText, config);
+    }
 
     // Image-only uploads (no OCR text validation required)
     // Only allow specific image-only document types like photos
@@ -617,6 +661,116 @@ class DocumentValidationService {
         'matched_keyword': foundKeyword,
       },
       errorMessage: null,
+    );
+  }
+
+  /// Birth certificates are issued in several PSA and Local Civil Registrar
+  /// layouts.  A title alone is not sufficient evidence (a random document can
+  /// mention PSA), but requiring one exact layout rejects legitimate copies.
+  /// Validate the combination of issuer, birth-specific labels, and identity
+  /// data instead.
+  static DocumentValidationResult _validateBirthCertificate(
+    String extractedText,
+    DocumentTypeConfig config,
+  ) {
+    final text = extractedText.toLowerCase();
+    final hasTitle = [
+      'certificate of live birth',
+      'birth certificate',
+      'certificate of birth',
+      'sertipiko ng kapanganakan',
+      'live birth',
+    ].any(text.contains) ||
+        (text.contains('certificate') &&
+            text.contains('birth') &&
+            (text.contains('live') || text.contains('kapanganakan')));
+    final hasIssuer = [
+      'philippine statistics authority',
+      'local civil registrar',
+      'civil registrar',
+      'civil registry',
+      'republic of the philippines',
+      'psa',
+    ].any(text.contains);
+    final fieldLabels = [
+      'name of child',
+      'name of the child',
+      'child name',
+      'name of registrant',
+      'surname',
+      'first name',
+      'middle name',
+      'date of birth',
+      'place of birth',
+      'sex',
+      'father',
+      'mother',
+      'maiden name',
+      'citizenship',
+      'legitimacy',
+      'date of occurrence',
+      'place of occurrence',
+      'type of birth',
+      'informant',
+      'attendant',
+      'pangalan',
+      'kapanganakan',
+      'ama',
+      'ina',
+    ];
+    final fieldCount = fieldLabels.where(text.contains).length;
+    final hasBirthDate = _extractBirthDate(extractedText).isNotEmpty;
+    final hasParent = text.contains('father') ||
+        text.contains('mother') ||
+        text.contains('ama') ||
+        text.contains('ina');
+    // A real certificate can have a partially obscured title, but a random
+    // file is very unlikely to contain both an issuing authority and several
+    // civil-registry fields.  This deliberately avoids a single-keyword rule.
+    final isValid = (hasTitle && hasIssuer && fieldCount >= 1) ||
+        (hasTitle && fieldCount >= 3) ||
+        (hasIssuer && fieldCount >= 4 && hasBirthDate && hasParent);
+
+    if (!isValid) {
+      return DocumentValidationResult(
+        isValid: false,
+        missingFields: ['birth_certificate_evidence'],
+        invalidFields: ['document_format'],
+        warnings: const [
+          'A birth certificate must show official birth-certificate information, not only a related keyword.',
+        ],
+        confidenceScore: 20.0,
+        extractedData: {
+          'document_type': config.displayName,
+          'birth_title_found': hasTitle,
+          'birth_issuer_found': hasIssuer,
+          'birth_field_label_count': fieldCount,
+        },
+        errorMessage: config.errorMessage,
+      );
+    }
+
+    final confidence = 70.0 +
+        (hasTitle ? 10.0 : 0.0) +
+        (hasIssuer ? 10.0 : 0.0) +
+        (hasBirthDate && hasParent ? 10.0 : 0.0);
+    return DocumentValidationResult(
+      isValid: true,
+      missingFields: const [],
+      invalidFields: const [],
+      warnings: hasBirthDate && hasParent
+          ? const []
+          : const [
+              'The document was recognized, but some details could not be extracted automatically.',
+            ],
+      confidenceScore: confidence > 100 ? 100 : confidence,
+      extractedData: {
+        'document_type': config.displayName,
+        'validation_method': 'birth_certificate_evidence',
+        'birth_title_found': hasTitle,
+        'birth_issuer_found': hasIssuer,
+        'birth_field_label_count': fieldCount,
+      },
     );
   }
 
@@ -848,20 +1002,52 @@ class DocumentValidationService {
         // Fallback - cannot read file
         throw Exception('Unable to read file: no bytes or path available');
       }
+      final fileName = documentFile.name.toLowerCase();
+      final isPdf = fileName.endsWith('.pdf');
+      final isUnsupportedOfficeFile =
+          fileName.endsWith('.doc') || fileName.endsWith('.docx');
+      if (isUnsupportedOfficeFile) {
+        // Vision's image endpoint cannot read Office files. Do not send their
+        // binary data as an image and then mislabel a valid document as random.
+        return const _DocumentOcrResult(
+          text: '',
+          qualityIssues: [],
+          warnings: [
+            'Word documents cannot be OCR-verified directly. Upload a PDF or a clear JPG/PNG scan instead.',
+          ],
+          qualityScore: 0.0,
+          qualityData: {'ocr_unsupported_format': true},
+        );
+      }
       final base64Image = base64Encode(bytes);
 
-      // Prepare OCR request with improved format
+      // PDFs require Vision's file endpoint. Sending a PDF to images:annotate
+      // always fails even when the certificate itself is legitimate.
       final requestBody = jsonEncode({
         'requests': [
-          {
-            'image': {'content': base64Image},
-            'features': [
-              {'type': 'DOCUMENT_TEXT_DETECTION', 'maxResults': 1},
-            ],
-            'imageContext': {
-              'languageHints': ['en', 'tl'], // English and Tagalog
-            },
-          },
+          isPdf
+              ? {
+                  'inputConfig': {
+                    'mimeType': 'application/pdf',
+                    'content': base64Image,
+                  },
+                  'features': [
+                    {'type': 'DOCUMENT_TEXT_DETECTION', 'maxResults': 1},
+                  ],
+                  'imageContext': {
+                    'languageHints': ['en', 'tl'],
+                  },
+                  'pages': [1],
+                }
+              : {
+                  'image': {'content': base64Image},
+                  'features': [
+                    {'type': 'DOCUMENT_TEXT_DETECTION', 'maxResults': 1},
+                  ],
+                  'imageContext': {
+                    'languageHints': ['en', 'tl'],
+                  },
+                },
         ],
       });
 
@@ -871,7 +1057,7 @@ class DocumentValidationService {
       final response = await http
           .post(
             Uri.parse(
-              'https://vision.googleapis.com/v1/images:annotate?key=${DefaultFirebaseOptions.visionApiKey}',
+              'https://vision.googleapis.com/v1/${isPdf ? 'files:annotate' : 'images:annotate'}?key=${DefaultFirebaseOptions.visionApiKey}',
             ),
             headers: {
               'Content-Type': 'application/json',
@@ -885,7 +1071,19 @@ class DocumentValidationService {
         final result = jsonDecode(response.body);
         print('DEBUG: Vision API response received');
 
-        final responses = result['responses'] as List?;
+        List? responses;
+        if (isPdf) {
+          final fileResponses = result['responses'];
+          if (fileResponses is List && fileResponses.isNotEmpty) {
+            final fileResponse = fileResponses.first;
+            if (fileResponse is Map<String, dynamic>) {
+              final pageResponses = fileResponse['responses'];
+              if (pageResponses is List) responses = pageResponses;
+            }
+          }
+        } else if (result['responses'] is List) {
+          responses = result['responses'] as List;
+        }
 
         if (responses != null && responses.isNotEmpty) {
           final firstResponse = responses[0] as Map<String, dynamic>?;
@@ -965,15 +1163,20 @@ class DocumentValidationService {
           qualityData: {'ocr_text_found': false},
         );
       } else {
+        final errorData = _visionErrorData(response.body);
         print(
           'DEBUG: Vision API Error: ${response.statusCode} - ${response.body}',
         );
-        return const _DocumentOcrResult(
+        return _DocumentOcrResult(
           text: '',
-          qualityIssues: [],
-          warnings: [],
+          qualityIssues: const [],
+          warnings: const [],
           qualityScore: 0.0,
-          qualityData: {'ocr_request_failed': true},
+          qualityData: {
+            'ocr_request_failed': true,
+            'ocr_http_status': response.statusCode,
+            ...errorData,
+          },
         );
       }
     } catch (e) {
@@ -986,6 +1189,35 @@ class DocumentValidationService {
         qualityScore: 0.0,
         qualityData: {'ocr_exception': true},
       );
+    }
+  }
+
+  static Map<String, dynamic> _visionErrorData(String responseBody) {
+    try {
+      final parsed = jsonDecode(responseBody);
+      if (parsed is! Map<String, dynamic>) return const {};
+      final error = parsed['error'];
+      if (error is! Map<String, dynamic>) return const {};
+      String? reason;
+      final details = error['details'];
+      if (details is List) {
+        for (final detail in details) {
+          if (detail is Map<String, dynamic> && detail['reason'] != null) {
+            reason = detail['reason'].toString();
+            break;
+          }
+        }
+      }
+      return {
+        'ocr_api_reason': reason ?? 'VISION_API_REQUEST_FAILED',
+        'ocr_api_error': error['message']?.toString() ??
+            'The OCR service did not accept this request.',
+      };
+    } catch (_) {
+      return const {
+        'ocr_api_reason': 'VISION_API_REQUEST_FAILED',
+        'ocr_api_error': 'The OCR service returned an unreadable error response.',
+      };
     }
   }
 
@@ -1324,10 +1556,28 @@ class DocumentValidationService {
     final data = <String, dynamic>{};
 
     // Extract common fields
-    data['full_name'] = _extractFullName(extractedText);
-    data['date_of_birth'] = _extractDate(extractedText);
-    data['place_of_birth'] = _extractPlace(extractedText);
-    data['parent_names'] = _extractParentNames(extractedText);
+    final fatherName = _extractLabeledValue(extractedText, [
+      "father(?:'s name)?",
+      'name of father',
+      'ama',
+    ]);
+    final motherName = _extractLabeledValue(extractedText, [
+      "mother(?:'s maiden name|'s name)?",
+      'name of mother',
+      'ina',
+    ]);
+    data['full_name'] = _extractChildName(extractedText);
+    data['date_of_birth'] = _extractBirthDate(extractedText);
+    data['place_of_birth'] = _extractLabeledValue(extractedText, [
+      'place of (?:birth|occurrence)',
+      'born in',
+      'lugar ng kapanganakan',
+    ]);
+    data['father_name'] = fatherName;
+    data['mother_name'] = motherName;
+    data['parent_names'] = [fatherName, motherName]
+        .where((name) => name.isNotEmpty)
+        .join(', ');
 
     // Extract sacrament-specific fields
     switch (sacramentType.toLowerCase()) {
@@ -1438,6 +1688,69 @@ class DocumentValidationService {
   }
 
   /// Text extraction helpers
+  static String _extractChildName(String text) {
+    return _extractLabeledValue(text, [
+      'name of (?:the )?child',
+      "child(?:'s)? name",
+      'name of registrant',
+      'full name',
+      'pangalan ng bata',
+      'pangalan',
+      'name',
+    ]);
+  }
+
+  static String _extractBirthDate(String text) {
+    final labeled = _extractLabeledValue(text, [
+      'date of (?:birth|occurrence)',
+      'birth date',
+      'petsa ng kapanganakan',
+    ], valueCanBeDate: true);
+    if (labeled.isNotEmpty) return _normaliseDate(labeled);
+    return _normaliseDate(_extractDate(text));
+  }
+
+  static String _extractLabeledValue(
+    String text,
+    List<String> labels, {
+    bool valueCanBeDate = false,
+  }) {
+    for (final label in labels) {
+      final pattern = RegExp(
+        '(?:^|\\n|\\r)\\s*(?:$label)\\s*[:\\-]?\\s*([^\\n\\r]{2,100})',
+        caseSensitive: false,
+      );
+      final match = pattern.firstMatch(text);
+      if (match == null) continue;
+      var value = match.group(1)!.trim();
+      value = value.replaceFirst(RegExp(r'^[.:-\s]+'), '');
+      value = value.replaceFirst(
+        RegExp(r'\s+(?:sex|father|mother|place|date|citizenship)\b.*$',
+            caseSensitive: false),
+        '',
+      );
+      if (valueCanBeDate) {
+        final date = RegExp(
+          r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4})\b',
+          caseSensitive: false,
+        ).firstMatch(value);
+        return date?.group(0) ?? '';
+      }
+      if (value.length >= 2) return value;
+    }
+    return '';
+  }
+
+  static String _normaliseDate(String value) {
+    final numeric = RegExp(r'^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$')
+        .firstMatch(value.trim());
+    if (numeric == null) return value.trim();
+    final year = numeric.group(3)!.length == 2
+        ? '19${numeric.group(3)}'
+        : numeric.group(3)!;
+    return '$year-${numeric.group(1)!.padLeft(2, '0')}-${numeric.group(2)!.padLeft(2, '0')}';
+  }
+
   static String _extractFullName(String text) {
     final namePattern = RegExp(
       r'(?:Name|Pangalan):\s*([A-Z][a-z]+\s+[A-Z][a-z]+)',
