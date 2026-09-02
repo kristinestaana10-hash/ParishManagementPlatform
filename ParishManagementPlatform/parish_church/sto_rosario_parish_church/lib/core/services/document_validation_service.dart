@@ -1033,18 +1033,26 @@ class DocumentValidationService {
                   },
                   'features': [
                     {'type': 'DOCUMENT_TEXT_DETECTION', 'maxResults': 1},
+                    {'type': 'TEXT_DETECTION', 'maxResults': 1},
                   ],
                   'imageContext': {
                     'languageHints': ['en', 'fil', 'tl'],
+                    'textDetectionParams': {
+                      'enableTextDetectionConfidenceScore': true,
+                    },
                   },
                 }
               : {
                   'image': {'content': base64Image},
                   'features': [
                     {'type': 'DOCUMENT_TEXT_DETECTION', 'maxResults': 1},
+                    {'type': 'TEXT_DETECTION', 'maxResults': 1},
                   ],
                   'imageContext': {
                     'languageHints': ['en', 'fil', 'tl'],
+                    'textDetectionParams': {
+                      'enableTextDetectionConfidenceScore': true,
+                    },
                   },
                 },
         ],
@@ -1109,7 +1117,7 @@ class DocumentValidationService {
               .where((text) => text.trim().isNotEmpty)
               .join('\n');
           if (fullText.isNotEmpty) {
-            final extractedText = fullText;
+            final extractedText = _normaliseOcrText(fullText);
             print(
               'DEBUG: Document text extracted: ${extractedText.substring(0, extractedText.length > 100 ? 100 : extractedText.length)}...',
             );
@@ -1122,13 +1130,16 @@ class DocumentValidationService {
             );
           }
 
-          // Fallback to textAnnotations
+          // `textAnnotations[0].description` contains the complete OCR
+          // reading. Reading every annotation duplicates words and makes
+          // label/value extraction much less reliable.
           final textAnnotations = firstResponse['textAnnotations'] as List?;
           if (textAnnotations != null && textAnnotations.isNotEmpty) {
-            final extractedText = textAnnotations
-                .map((annotation) => annotation['text'] as String?)
-                .where((text) => text != null && text.isNotEmpty)
-                .join(' ');
+            final firstAnnotation = textAnnotations.first;
+            final annotationText = firstAnnotation is Map
+                ? firstAnnotation['description']?.toString() ?? ''
+                : '';
+            final extractedText = _normaliseOcrText(annotationText);
 
             if (extractedText.isNotEmpty) {
               print(
@@ -1144,27 +1155,6 @@ class DocumentValidationService {
             }
           }
 
-          // Try TEXT_DETECTION as last resort
-          final textDetections = firstResponse['textAnnotations'] as List?;
-          if (textDetections != null && textDetections.isNotEmpty) {
-            final extractedText = textDetections
-                .map((detection) => detection['description'] as String?)
-                .where((text) => text != null && text.isNotEmpty)
-                .join(' ');
-
-            if (extractedText.isNotEmpty) {
-              print(
-                'DEBUG: Text detections extracted: ${extractedText.substring(0, extractedText.length > 100 ? 100 : extractedText.length)}...',
-              );
-              return _DocumentOcrResult(
-                text: extractedText,
-                qualityIssues: qualityResult.qualityIssues,
-                warnings: qualityResult.warnings,
-                qualityScore: qualityResult.qualityScore,
-                qualityData: qualityResult.qualityData,
-              );
-            }
-          }
         }
 
         print('DEBUG: Vision API: No text found in response');
@@ -1206,6 +1196,21 @@ class DocumentValidationService {
         qualityData: {'ocr_exception': true},
       );
     }
+  }
+
+  /// Cleans only layout and well-known scan artifacts.  It deliberately does
+  /// not change ordinary letters in names or places, because those values are
+  /// shown to the user for review before use.
+  static String _normaliseOcrText(String text) {
+    return text
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n')
+        .replaceAll(RegExp(r'[\u00ad]'), '') // soft hyphen from PDF text
+        .replaceAll(RegExp(r'(?<=\w)-\s*\n\s*(?=\w)'), '')
+        .replaceAll(RegExp(r'[\t\f\v ]+'), ' ')
+        .replaceAll(RegExp(r' *\n *'), '\n')
+        .replaceAll(RegExp(r'\n{3,}'), '\n\n')
+        .trim();
   }
 
   static Map<String, dynamic> _visionErrorData(String responseBody) {
@@ -1571,13 +1576,17 @@ class DocumentValidationService {
   ) async {
     final data = <String, dynamic>{};
 
-    // A requirement is the extraction target.  This prevents a document from
-    // being treated as a generic block of text and lets the form safely use
-    // birth-certificate fields only when a birth certificate was uploaded.
-    final isBirthCertificate = requirementType.toLowerCase().contains('birth') ||
-        requirementType.toLowerCase().contains('kapanganakan');
-    data['extraction_target'] =
-        isBirthCertificate ? 'birth_certificate' : 'general_document';
+    // Use the selected requirement as the extraction target. Every uploaded
+    // document still goes through OCR; this target tells the form which of
+    // the recognized values are safe to offer for autofill.
+    final extractionTarget = _documentExtractionTarget(requirementType);
+    final isBirthCertificate = extractionTarget == 'birth_certificate';
+    data['extraction_target'] = extractionTarget;
+    if (extractionTarget != 'general_document') {
+      // Keep addresses separate from places of birth/death/baptism. The form
+      // layer may only use this value for an explicitly address-like field.
+      data['address'] = _extractAddress(extractedText);
+    }
 
     // Extract common fields
     final fatherName = _extractLabeledValue(extractedText, [
@@ -1611,6 +1620,96 @@ class DocumentValidationService {
           .join(', ');
     }
 
+    if (extractionTarget == 'baptismal_certificate') {
+      data['full_name'] = _extractBaptismalCertificateName(extractedText);
+      data['date_of_birth'] = _extractLabeledDate(extractedText, [
+        'date of birth',
+        'birth date',
+        'born on',
+        'petsa ng kapanganakan',
+      ]);
+      data['place_of_birth'] = _extractLabeledValue(extractedText, [
+        'place of birth',
+        'born in',
+        'lugar ng kapanganakan',
+      ]);
+      data['date_of_baptism'] = _extractLabeledDate(extractedText, [
+        'date of baptism',
+        'baptism date',
+        'was solemnly baptized on',
+        'was baptised on',
+        'was baptized on',
+        'baptized on',
+        'petsa ng binyag',
+        'kailan nabinyagan',
+      ]);
+      data['place_of_baptism'] = _extractLabeledValue(extractedText, [
+        'place of baptism',
+        'parish of baptism',
+        'church of baptism',
+        'was solemnly baptized at',
+        'was baptized at',
+        'baptized at',
+        'saan nabinyagan',
+        'lugar ng binyag',
+      ]);
+      data['parish_name'] = _extractParishName(extractedText);
+    }
+
+    if (extractionTarget == 'confirmation_certificate') {
+      data['full_name'] = _extractPersonName(extractedText);
+      data['date_of_confirmation'] = _extractLabeledDate(extractedText, [
+        'date of confirmation',
+        'confirmation date',
+        'petsa ng kumpil',
+      ]);
+      data['parish_name'] = _extractParishName(extractedText);
+    }
+
+    if (extractionTarget == 'marriage_document') {
+      data['full_name'] = _extractPersonName(extractedText);
+      data['spouse_name'] = _extractSpouseName(extractedText);
+      data['date_of_marriage'] = _extractLabeledDate(extractedText, [
+        'date of marriage',
+        'marriage date',
+        'date of solemnization',
+        'petsa ng kasal',
+      ]);
+      data['parish_name'] = _extractParishName(extractedText);
+    }
+
+    if (extractionTarget == 'death_certificate') {
+      data['full_name'] = _extractPersonName(extractedText);
+      data['date_of_death'] = _extractDeathDate(extractedText);
+      data['cause_of_death'] = _extractCauseOfDeath(extractedText);
+      data['place_of_death'] = _extractLabeledValue(extractedText, [
+        'place of death',
+        'place of occurrence',
+        'lugar ng kamatayan',
+      ]);
+    }
+
+    if (extractionTarget == 'burial_permit') {
+      data['full_name'] = _extractPersonName(extractedText);
+      data['burial_date'] = _extractLabeledDate(extractedText, [
+        'date of burial',
+        'date of interment',
+        'burial date',
+        'petsa ng libing',
+      ]);
+      data['burial_place'] = _extractLabeledValue(extractedText, [
+        'cemetery',
+        'place of burial',
+        'place of interment',
+        'lugar ng libing',
+      ]);
+    }
+
+    if (extractionTarget == 'cenomar' || extractionTarget == 'marriage_banns') {
+      data['full_name'] = _extractPersonName(extractedText);
+      data['parish_name'] = _extractParishName(extractedText);
+    }
+
     // Extract sacrament-specific fields
     switch (sacramentType.toLowerCase()) {
       case 'wedding':
@@ -1624,6 +1723,31 @@ class DocumentValidationService {
     }
 
     return data;
+  }
+
+  static String _documentExtractionTarget(String requirementType) {
+    final type = requirementType.toLowerCase();
+    if (type.contains('birth') || type.contains('kapanganakan')) {
+      return 'birth_certificate';
+    }
+    if (type.contains('baptism') || type.contains('binya')) {
+      return 'baptismal_certificate';
+    }
+    if (type.contains('confirmation') || type.contains('kumpil')) {
+      return 'confirmation_certificate';
+    }
+    if (type.contains('marriage license') ||
+        type.contains('marriage contract') ||
+        type.contains('marriage certificate')) {
+      return 'marriage_document';
+    }
+    if (type.contains('death') || type.contains('kamatayan')) {
+      return 'death_certificate';
+    }
+    if (type.contains('burial') || type.contains('libing')) return 'burial_permit';
+    if (type.contains('cenomar') || type.contains('no marriage')) return 'cenomar';
+    if (type.contains('banns')) return 'marriage_banns';
+    return 'general_document';
   }
 
   /// Helper methods for field extraction
@@ -1737,6 +1861,67 @@ class DocumentValidationService {
     ]);
   }
 
+  static String _extractPersonName(String text) {
+    return _extractLabeledValue(text, [
+      'full name',
+      'complete name',
+      'name of (?:the )?(?:person|applicant|deceased|contracting party)',
+      'name of registrant',
+      'pangalan ng (?:tao|aplikante|namatay)',
+      'buong pangalan',
+      'pangalan',
+      'name',
+    ]);
+  }
+
+  static String _extractBaptismalCertificateName(String text) {
+    final labeled = _extractPersonName(text);
+    if (labeled.isNotEmpty) return labeled;
+
+    // A common parish certificate reads: "This is to certify that [name] was
+    // solemnly baptized on ...". It has no explicit Name field, so parse the
+    // person between the certificate phrase and the baptism/birth statement.
+    final match = RegExp(
+      r'this\s+is\s+to\s+certify\s+that\s+(.{2,100}?)\s+(?:who\s+)?was\s+(?:solemnly\s+)?(?:baptized|baptised|born)\b',
+      caseSensitive: false,
+      dotAll: true,
+    ).firstMatch(text);
+    if (match == null) return '';
+    return _cleanOcrFieldValue(match.group(1)!).replaceAll('\n', ' ');
+  }
+
+  static String _extractLabeledDate(String text, List<String> labels) {
+    final labeled = _extractLabeledValue(
+      text,
+      labels,
+      valueCanBeDate: true,
+    );
+    return labeled.isEmpty ? '' : _normaliseDate(labeled);
+  }
+
+  static String _extractParishName(String text) {
+    return _extractLabeledValue(text, [
+      'parish(?: name)?',
+      'name of parish',
+      'church(?: name)?',
+      'diocese',
+      'parokya',
+      'pangalan ng parokya',
+    ]);
+  }
+
+  static String _extractAddress(String text) {
+    return _extractLabeledValue(text, [
+      'current address',
+      'residential address',
+      'home address',
+      'permanent address',
+      'address',
+      'tirahan',
+      'kasalukuyang tirahan',
+    ]);
+  }
+
   static String _extractBirthDate(String text) {
     final labeled = _extractLabeledValue(text, [
       'date of (?:birth|occurrence)',
@@ -1793,11 +1978,33 @@ class DocumentValidationService {
   /// tolerant of OCR that separates a table label and its value onto adjacent
   /// lines, without depending on a particular PSA/LCR certificate layout.
   static Iterable<String> _ocrReadingVariants(String text) sync* {
-    final normalized = text
-        .replaceAll('\r\n', '\n')
-        .replaceAll('\r', '\n')
-        .replaceAll(RegExp(r'[\t\f\v ]+'), ' ');
+    final normalized = _normaliseOcrText(text);
     yield normalized;
+
+    // Table cells are often returned as separate lines. A joined reading
+    // lets the same label/value expressions work for both tables and prose.
+    yield normalized.replaceAll('\n', ' ');
+
+    // OCR commonly reads zero as O and one as I/l in numeric values. Keep
+    // this correction limited to digits so person and place names are never
+    // changed.
+    yield normalized
+        .replaceAllMapped(
+          RegExp(r'(\d)[Oo](?=\d|[./-])'),
+          (match) => '${match.group(1)}0',
+        )
+        .replaceAllMapped(
+          RegExp(r'(?<=[./-])[Oo](?=\d)'),
+          (_) => '0',
+        )
+        .replaceAllMapped(
+          RegExp(r'(\d)[Il](?=\d|[./-])'),
+          (match) => '${match.group(1)}1',
+        )
+        .replaceAllMapped(
+          RegExp(r'(?<=[./-])[Il](?=\d)'),
+          (_) => '1',
+        );
 
     final lines = normalized
         .split('\n')
@@ -1807,6 +2014,11 @@ class DocumentValidationService {
     for (var index = 0; index + 1 < lines.length; index++) {
       // A two-line window catches `DATE OF BIRTH` followed by its value.
       yield '${lines[index]}\n${lines[index + 1]}';
+    }
+    for (var index = 0; index + 2 < lines.length; index++) {
+      // Some certificate layouts put a label, value, and qualifier on three
+      // separate lines. Preserve all three so the value is not discarded.
+      yield '${lines[index]}\n${lines[index + 1]}\n${lines[index + 2]}';
     }
   }
 

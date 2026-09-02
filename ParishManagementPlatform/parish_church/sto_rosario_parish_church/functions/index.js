@@ -2543,10 +2543,15 @@ exports.getBookingAvailability = onCall(
 );
 
 const PARISH_ASSISTANT_CONTEXT = `You are the AI assistant for Sto. Rosario Parish Church.
-Answer only parish-related questions using facts in the supplied database context. Do not use general knowledge, infer missing facts, or answer unrelated questions. If the requested fact is not in the database context, clearly say that no official database record is available.
+Answer only parish-related questions using facts in the supplied database context. The database context is authoritative and takes priority over every other source. Do not use general knowledge, infer missing facts, repeat facts from conversation history, or answer unrelated questions. If the requested fact is not in the database context, clearly state that the information is currently unavailable and, where appropriate, politely advise the parishioner to contact the parish office.
+
+Tone and presentation:
+- Write in a formal, clear, courteous, and pastoral manner suitable for a parish office.
+- Keep the answer focused on parish services, sacraments, bookings, schedules, announcements, donations, chapels, and other parish activities.
+- State only information supported by the supplied database context. Do not fill gaps with likely practices, estimates, or assumptions.
 
 Privacy rules:
-- Never reveal private names, emails, phone numbers, addresses, payment methods, document links, health details, or specific booking owner details.
+- Never reveal private names, emails, phone numbers, addresses, payment methods, document links, health details, or specific booking owner details. Public parish contact details explicitly present in the supplied context may be shared.
 - For bookings and donations, answer with aggregate status or the signed-in user's own summarized records only.
 - If a user asks for another person's records or confidential details, politely refuse.
 - Match the user's language. Use Tagalog for Tagalog questions and English for English questions.
@@ -2619,14 +2624,19 @@ function detectAssistantIntent(text) {
   }
   if (/(mass|misa|service|sunday|daily)/i.test(lower)) intents.add('mass_schedule');
   if (/(announcement|event|fiesta|thanksgiving|holy week|anunsyo|kaganapan)/i.test(lower)) intents.add('announcements');
-  if (/(donat|donation|alay|abuloy|bigay|in-kind)/i.test(lower)) intents.add('donations');
+  if (/(donat|donation|alay|abuloy|bigay|in-kind|donation drive|kampanya)/i.test(lower)) intents.add('donations');
   if (/(my booking|my reservation|aking booking|booking ko|requests ko)/i.test(lower)) intents.add('my_bookings');
-  if (/(contact|phone|email|address|location|saan|lokasyon|numero)/i.test(lower)) intents.add('contact');
+  if (/(contact|phone|email|address|location|saan|lokasyon|numero|office|oras ng opisina)/i.test(lower)) intents.add('contact');
+  if (/(chapel|chapels|kapilya|history|kasaysayan|founded|itinatag|priest|pari)/i.test(lower)) intents.add('parish_info');
 
   return Array.from(intents);
 }
 
 const SERVICE_FACT_COLLECTIONS = [
+  // This is the source used by the booking screens for the currently
+  // available sacrament forms. Keep it first so the assistant reads the
+  // same parish-managed records that users see in the app.
+  'booking_requirements',
   'booking_forms',
   'sacramentServices',
   'churchServices',
@@ -2681,6 +2691,16 @@ const PUBLIC_SERVICE_FACT_KEYS = new Set([
   'lastUpdated',
 ]);
 
+const PUBLIC_PARISH_PROFILE_KEYS = new Set([
+  'name', 'parishName', 'parishNameTagalog', 'address', 'location',
+  'phone', 'contactNumber', 'email', 'contact', 'officeHours',
+  'officeSchedule', 'office_schedule', 'massSchedule', 'massSchedules',
+  'mass_schedule', 'schedule', 'services', 'sacraments', 'serviceFees',
+  'sacramentFees', 'fees', 'requirements', 'chapels', 'chapel', 'priest',
+  'currentPriest', 'history', 'announcements', 'notes', 'reminders',
+  'updatedAt', 'lastUpdated',
+]);
+
 function sanitizePublicValue(value, depth = 0) {
   if (value == null) return null;
   if (depth > 3) return '[nested data omitted]';
@@ -2697,6 +2717,43 @@ function sanitizePublicValue(value, depth = 0) {
     return out;
   }
   return null;
+}
+
+function parishInformationUnavailableReply(language) {
+  return language === 'tagalog'
+    ? 'Paumanhin, ang hinihingi ninyong impormasyon ay kasalukuyang walang opisyal na record sa parish system. Para sa tamang gabay, mangyaring makipag-ugnayan sa parish office.'
+    : 'We apologize, but the requested information is currently unavailable in the parish system. For accurate guidance, please contact the parish office.';
+}
+
+// Parish profile documents are public in Firestore, but the assistant still
+// receives only public-facing content fields. This keeps administrative and
+// member-only metadata out of the model prompt.
+function sanitizePublicParishValue(value, depth = 0) {
+  if (value == null) return null;
+  if (depth > 4) return '[nested data omitted]';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (value instanceof admin.firestore.Timestamp) return value.toDate().toISOString();
+  if (Array.isArray(value)) return value.slice(0, 30).map((item) => sanitizePublicParishValue(item, depth + 1));
+  if (typeof value === 'object') {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (/name|title|label|day|date|time|hour|schedule|service|sacrament|fee|price|cost|amount|require|document|description|note|reminder|address|location|phone|email|priest|chapel|history|content|details?|introduction|timeline|heritage|year|barangay/i.test(key)) {
+        out[key] = sanitizePublicParishValue(item, depth + 1);
+      }
+    }
+    return out;
+  }
+  return null;
+}
+
+function compactPublicParishProfile(profile) {
+  const out = {};
+  for (const [key, value] of Object.entries(profile || {})) {
+    if (PUBLIC_PARISH_PROFILE_KEYS.has(key)) {
+      out[key] = sanitizePublicParishValue(value);
+    }
+  }
+  return out;
 }
 
 function compactPublicServiceDoc(doc, collectionName) {
@@ -2890,6 +2947,7 @@ async function getPublicParishSnapshot(db, intents, message) {
     serviceFacts: [],
     massSchedules: [],
     announcements: [],
+    donationDrives: [],
     availability: null,
     donationSummary: null,
   };
@@ -2904,6 +2962,7 @@ async function getPublicParishSnapshot(db, intents, message) {
         phone: profile.phone || profile.contactNumber || null,
         email: profile.email || null,
         officeHours: profile.officeHours || null,
+        publicDetails: compactPublicParishProfile(profile),
       };
 
       const profileFactFields = ['sacraments', 'services', 'serviceFees', 'sacramentFees', 'fees', 'requirements'];
@@ -2926,52 +2985,78 @@ async function getPublicParishSnapshot(db, intents, message) {
     console.warn('askParishAssistant: parish profile read failed', err?.message);
   }
 
-  if (intents.includes('service_facts')) {
-    for (const collectionName of SERVICE_FACT_COLLECTIONS) {
-      try {
-        const snap = await db.collection(collectionName).limit(50).get();
-        snap.docs.forEach((doc) => {
-          const fact = compactPublicServiceDoc(doc, collectionName);
-          if (serviceFactMatches(message, fact)) snapshot.serviceFacts.push(fact);
-        });
-      } catch (err) {
-        console.warn(`askParishAssistant: ${collectionName} read failed`, err?.message);
-      }
-    }
-    snapshot.serviceFacts = snapshot.serviceFacts.slice(0, 20);
-  }
-
-  if (intents.includes('mass_schedule')) {
+  // Load every public service definition on each parish question. Keyword
+  // detection is intentionally not used as a retrieval gate: a question can
+  // be phrased without the exact sacrament or requirement keywords stored in
+  // the record, and the matching facts must still reach the assistant.
+  await Promise.all(SERVICE_FACT_COLLECTIONS.map(async (collectionName) => {
     try {
-      const massSnap = await db.collection('massSchedules').where('active', '==', true).limit(20).get();
-      snapshot.massSchedules = massSnap.docs.map((doc) => {
-        const row = doc.data() || {};
-        return {
-          dayOfWeek: row.dayOfWeek || null,
-          date: row.date || null,
-          startTime: row.startTime || row.time || null,
-          endTime: row.endTime || null,
-        };
+      const snap = await db.collection(collectionName).limit(50).get();
+      snap.docs.forEach((doc) => {
+        const fact = compactPublicServiceDoc(doc, collectionName);
+        if (serviceFactMatches(message, fact)) snapshot.serviceFacts.push(fact);
       });
     } catch (err) {
-      console.warn('askParishAssistant: mass schedule read failed', err?.message);
+      console.warn(`askParishAssistant: ${collectionName} read failed`, err?.message);
     }
-  }
+  }));
+  snapshot.serviceFacts = snapshot.serviceFacts.slice(0, 20);
 
-  if (intents.includes('announcements')) {
+  // Both names are used by the app. Read them without an `active` query so
+  // older public schedule records, which do not have that field, are not lost.
+  await Promise.all(['mass_schedules', 'massSchedules'].map(async (collectionName) => {
     try {
-      const announcementSnap = await db.collection('announcements').orderBy('createdAt', 'desc').limit(5).get();
-      snapshot.announcements = announcementSnap.docs.map((doc) => {
+      const massSnap = await db.collection(collectionName).limit(50).get();
+      snapshot.massSchedules.push(...massSnap.docs
+        .filter((doc) => doc.data()?.active !== false)
+        .map((doc) => {
+          const row = doc.data() || {};
+          return {
+            sourceCollection: collectionName,
+            dayOfWeek: row.dayOfWeek || null,
+            date: row.date || null,
+            startTime: row.startTime || row.time || null,
+            endTime: row.endTime || null,
+            title: row.title || row.name || null,
+            description: row.description || null,
+          };
+        }));
+    } catch (err) {
+      console.warn(`askParishAssistant: ${collectionName} read failed`, err?.message);
+    }
+  }));
+
+  try {
+    const announcementSnap = await db.collection('announcements').limit(20).get();
+    snapshot.announcements = announcementSnap.docs.map((doc) => {
         const row = doc.data() || {};
         return {
           title: row.title || null,
           date: row.date || null,
           summary: row.summary || row.description || row.content || null,
         };
+      }).slice(0, 10);
+  } catch (err) {
+    console.warn('askParishAssistant: announcements read failed', err?.message);
+  }
+
+  try {
+    const driveSnap = await db.collection('donation_drives').limit(20).get();
+    snapshot.donationDrives = driveSnap.docs
+      .filter((doc) => !['closed', 'cancelled', 'archived'].includes(String(doc.data()?.status || '').toLowerCase()))
+      .map((doc) => {
+        const row = doc.data() || {};
+        return {
+          title: row.title || null,
+          description: row.description || null,
+          status: row.status || null,
+          targetAmount: row.targetAmount || row.goalAmount || row.fundingGoal || row.goal || null,
+          raisedAmount: row.raisedAmount || row.currentAmount || row.amountRaised || row.collectedAmount || null,
+          endDate: row.endDate || row.deadline || row.closingDate || null,
+        };
       });
-    } catch (err) {
-      console.warn('askParishAssistant: announcements read failed', err?.message);
-    }
+  } catch (err) {
+    console.warn('askParishAssistant: donation drives read failed', err?.message);
   }
 
   if (intents.includes('donations')) {
@@ -3073,6 +3158,21 @@ async function getUserScopedSnapshot(db, uid, intents) {
   };
 }
 
+function hasGroundedAssistantData(publicData, userData) {
+  const profile = publicData?.parishProfile || {};
+  return Boolean(
+    profile.name || profile.address || profile.phone || profile.email ||
+    Object.keys(profile.publicDetails || {}).length ||
+    publicData?.serviceFacts?.length ||
+    publicData?.massSchedules?.length ||
+    publicData?.announcements?.length ||
+    publicData?.donationDrives?.length ||
+    publicData?.availability ||
+    publicData?.donationSummary ||
+    userData?.myBookings?.length,
+  );
+}
+
 exports.askParishAssistant = onCall(
   {
     region: 'asia-southeast1',
@@ -3080,7 +3180,6 @@ exports.askParishAssistant = onCall(
   },
   async (request) => {
     const message = requireBoundedString(request.data?.message, 'message', 1200);
-    const rawHistory = Array.isArray(request.data?.history) ? request.data.history.slice(-8) : [];
     const language = detectAssistantLanguage(message);
     const intents = detectAssistantIntent(message);
 
@@ -3097,6 +3196,14 @@ exports.askParishAssistant = onCall(
 
     const publicData = await getPublicParishSnapshot(db, intents, message);
     const userData = await getUserScopedSnapshot(db, request.auth?.uid || '', intents);
+    if (!hasGroundedAssistantData(publicData, userData)) {
+      return {
+        reply: parishInformationUnavailableReply(language),
+        intents,
+        usedRealtimeData: true,
+        answeredFromDatabase: true,
+      };
+    }
     const directAnswer = directServiceFactAnswer(language, intents, publicData.serviceFacts || []);
     if (directAnswer) {
       return {
@@ -3107,13 +3214,6 @@ exports.askParishAssistant = onCall(
       };
     }
 
-    const safeHistory = rawHistory
-      .filter((item) => item && (item.role === 'user' || item.role === 'assistant') && typeof item.content === 'string')
-      .map((item) => ({
-        role: item.role,
-        content: item.content.slice(0, 1000),
-      }));
-
     const systemPrompt = `${PARISH_ASSISTANT_CONTEXT}
 
 Detected language: ${language}
@@ -3123,7 +3223,7 @@ Authenticated user: ${request.auth?.uid ? 'yes' : 'no'}
 Whitelisted real-time database context:
 ${JSON.stringify({ publicData, userData }, null, 2)}
 
-Answer naturally and concisely. Cite only facts found in the supplied database context. Never answer from general knowledge or from the conversation history. Do not mention implementation details, APIs, JSON, Firestore, or database internals unless the user asks technical support staff questions.`;
+Answer naturally and concisely. Cite only facts found in the supplied database context. Never answer from general knowledge or from the conversation history. If the context does not contain the requested fact, use the prescribed unavailable-information response. Do not mention implementation details, APIs, JSON, Firestore, or database internals unless the user asks technical support staff questions.`;
 
     const apiKey = (GROQ_API_KEY.value() || process.env.GROQ_API_KEY || '').trim();
     if (!apiKey) {
@@ -3140,7 +3240,6 @@ Answer naturally and concisely. Cite only facts found in the supplied database c
         model: GROQ_CHAT_MODEL,
         messages: [
           { role: 'system', content: systemPrompt },
-          ...safeHistory,
           { role: 'user', content: message },
         ],
         temperature: 0.2,

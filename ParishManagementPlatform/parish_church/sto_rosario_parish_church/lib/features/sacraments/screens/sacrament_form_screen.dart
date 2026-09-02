@@ -1510,12 +1510,16 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             _validationResults[requirementIndex] = validationResult;
           });
 
-          if (!_applyAndReviewOcrData(validationResult, requirementIndex)) {
+          final didAutoFill = await _reviewAndAutoFillOcrData(
+            validationResult,
+            requirementIndex,
+          );
+          if (!didAutoFill && mounted) {
             _showModalNotificationGlobal(
               context,
               widget.isTagalog
-                  ? 'Matagumpay na na-upload!'
-                  : 'Successfully uploaded!',
+                  ? 'Matagumpay na na-upload. Walang detalyeng awtomatikong idinagdag.'
+                  : 'Successfully uploaded. No details were auto-filled.',
               bgColor: ParishColors.greenSuccess,
             );
           }
@@ -5044,19 +5048,17 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     );
   }
 
-  /// Applies only empty booking fields, so an upload never replaces details the
-  /// user has already typed.  The visible review dialog makes the automatic
-  /// fill transparent before the booking can be submitted.
-  bool _applyAndReviewOcrData(
+  /// Previews OCR matches first. The form is mutated only after the user
+  /// explicitly confirms the proposed values in the review dialog.
+  Future<bool> _reviewAndAutoFillOcrData(
     DocumentValidationResult result,
     int requirementIndex,
-  ) {
+  ) async {
     final data = result.extractedData;
-    final applied = <String, String>{};
-    final isBirthCertificate =
-        data['extraction_target'] == 'birth_certificate' ||
-        (data['document_type'] ?? '').toString().toLowerCase().contains('birth');
-    if (!isBirthCertificate) return false;
+    final proposed = <String, String>{};
+    // Every supported requirement can contribute OCR values. Values are only
+    // offered for empty, semantically matching fields below, so a document
+    // never overwrites information the parishioner has already entered.
     final requirement = _data.requirements[requirementIndex].toLowerCase();
     final subject = requirement.contains('groom')
         ? 'groom'
@@ -5073,13 +5075,35 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       return null;
     }
 
+    bool isDateValue(String candidate) =>
+        RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(candidate) &&
+        DateTime.tryParse(candidate) != null;
+
+    bool isNameValue(String candidate) {
+      if (candidate.length < 2 || candidate.length > 100) return false;
+      if (RegExp(r'\d|@|https?://', caseSensitive: false).hasMatch(candidate)) {
+        return false;
+      }
+      return RegExp(r"^[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .,'-]*$").hasMatch(candidate);
+    }
+
+    bool isTextValue(String candidate) =>
+        candidate.length >= 2 &&
+        candidate.length <= 160 &&
+        !RegExp(r'https?://|\b(?:certificate|registry)\s*(?:no|number)\b',
+                caseSensitive: false)
+            .hasMatch(candidate);
+
     void apply(
       String extractedKey,
       bool Function(String normalized) matches, {
       bool preferCertificateSubject = false,
+      bool Function(String value)? isValid,
     }) {
       final extracted = value(extractedKey);
-      if (extracted.isEmpty) return;
+      if (extracted.isEmpty || !(isValid?.call(extracted) ?? isTextValue(extracted))) {
+        return;
+      }
       final key = preferCertificateSubject && subject.isNotEmpty
           ? (findField((field) => field.contains(subject) && matches(field)) ??
               findField(matches))
@@ -5087,47 +5111,168 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       if (key == null) return;
       final controller = _controllers[key];
       if (controller != null && controller.text.trim().isEmpty) {
-        controller.text = extracted;
-        applied[key] = extracted;
+        proposed[key] = extracted;
       }
     }
 
-    // The exclusions keep a child's details out of parent, godparent, and
-    // contact-name fields even when a parish uses custom field labels.
-    apply('full_name', (field) =>
-        (field.contains('name') || field.contains('pangalan')) &&
-        !field.contains('father') &&
-        !field.contains('mother') &&
-        !field.contains('ama') &&
-        !field.contains('ina') &&
-        !field.contains('godparent') &&
-        !field.contains('ninong') &&
-        !field.contains('ninang') &&
-        !field.contains('contact'),
-        preferCertificateSubject: true);
+    void applyName(String extractedKey, {String role = ''}) {
+      final extracted = value(extractedKey);
+      if (!isNameValue(extracted)) return;
+      final parts = extracted.split(RegExp(r'\s+'));
+      final first = parts.first;
+      final surname = parts.length > 1 ? parts.last : '';
+      final middle = parts.length > 2
+          ? parts.sublist(1, parts.length - 1).join(' ')
+          : '';
+
+      for (final entry in _controllers.entries) {
+        final field = entry.key.toLowerCase();
+        final controller = entry.value;
+        if (controller.text.trim().isNotEmpty ||
+            !(field.contains('name') ||
+                field.contains('pangalan') ||
+                field.contains('first') ||
+                field.contains('middle') ||
+                field.contains('surname') ||
+                field.contains('last name'))) {
+          continue;
+        }
+
+        final hasOtherPersonRole = [
+          'father', 'mother', 'ama', 'ina', 'godparent', 'ninong', 'ninang',
+          'contact', 'spouse', 'asawa', 'witness', 'saksi',
+        ].any(field.contains);
+        if (role.isNotEmpty) {
+          var roleMatches = field.contains(role);
+          if (role == 'father') {
+            roleMatches = field.contains('father') || field.contains('ama');
+          } else if (role == 'mother') {
+            roleMatches = field.contains('mother') || field.contains('ina');
+          } else if (role == 'spouse') {
+            roleMatches = field.contains('spouse') || field.contains('asawa');
+          }
+          if (!roleMatches) continue;
+        } else if (hasOtherPersonRole) {
+          continue;
+        }
+
+        String? mappedValue;
+        if (field.contains('first')) {
+          mappedValue = first;
+        } else if (field.contains('middle')) {
+          mappedValue = middle;
+        } else if (field.contains('surname') || field.contains('last name')) {
+          mappedValue = surname;
+        } else if (field.contains('full') ||
+            (!field.contains('first') &&
+                !field.contains('middle') &&
+                !field.contains('surname'))) {
+          mappedValue = extracted;
+        }
+
+        if (mappedValue != null && mappedValue.isNotEmpty) {
+          proposed[entry.key] = mappedValue;
+        }
+      }
+    }
+
+    // Names are split only into name fields. Dates, addresses, and places
+    // have their own independently validated mappings below.
+    applyName('full_name', role: subject);
+    applyName('father_name', role: 'father');
+    applyName('mother_name', role: 'mother');
+    applyName('spouse_name', role: 'spouse');
     apply('date_of_birth',
         (field) =>
             (field.contains('date') || field.contains('petsa')) &&
-            (field.contains('birth') || field.contains('kapanganakan')));
+            (field.contains('birth') || field.contains('kapanganakan')),
+        isValid: isDateValue);
     apply('place_of_birth',
         (field) =>
             (field.contains('place') || field.contains('lugar')) &&
-            (field.contains('birth') || field.contains('kapanganakan')));
-    apply('father_name',
+            (field.contains('birth') || field.contains('kapanganakan')),
+        isValid: isTextValue);
+    apply('address',
+        (field) => field.contains('address') || field.contains('tirahan'),
+        isValid: isTextValue);
+    apply('date_of_baptism',
         (field) =>
-            (field.contains('father') || field.contains('ama')) &&
-            (field.contains('name') || field.contains('pangalan')));
-    apply('mother_name',
+            (field.contains('date') || field.contains('petsa') || field.contains('kailan')) &&
+            (field.contains('baptism') || field.contains('binyag') || field.contains('nabinyag')),
+        isValid: isDateValue);
+    apply('place_of_baptism',
         (field) =>
-            (field.contains('mother') || field.contains('ina')) &&
-            (field.contains('name') || field.contains('pangalan')));
+            (field.contains('place') || field.contains('lugar') || field.contains('saan')) &&
+            (field.contains('baptism') || field.contains('binyag') || field.contains('nabinyag')),
+        isValid: isTextValue);
+    apply('date_of_confirmation',
+        (field) =>
+            (field.contains('date') || field.contains('petsa')) &&
+            (field.contains('confirmation') || field.contains('kumpil')),
+        isValid: isDateValue);
+    apply('date_of_marriage',
+        (field) =>
+            (field.contains('date') || field.contains('petsa')) &&
+            (field.contains('marriage') || field.contains('wedding') || field.contains('kasal')),
+        isValid: isDateValue);
+    apply('date_of_death',
+        (field) =>
+            (field.contains('date') || field.contains('petsa')) &&
+            (field.contains('death') || field.contains('kamatayan')),
+        isValid: isDateValue);
+    apply('place_of_death',
+        (field) =>
+            (field.contains('place') || field.contains('lugar')) &&
+            (field.contains('death') || field.contains('kamatayan')),
+        isValid: isTextValue);
+    apply('cause_of_death',
+        (field) =>
+            (field.contains('cause') || field.contains('sanhi')) &&
+            (field.contains('death') || field.contains('kamatayan')),
+        isValid: isTextValue);
+    apply('burial_date',
+        (field) =>
+            (field.contains('date') || field.contains('petsa')) &&
+            (field.contains('burial') || field.contains('libing')),
+        isValid: isDateValue);
+    apply('burial_place',
+        (field) =>
+            (field.contains('place') || field.contains('lugar')) &&
+            (field.contains('burial') || field.contains('libing')),
+        isValid: isTextValue);
+    apply('parish_name', (field) =>
+        field.contains('parish') || field.contains('parokya'),
+        isValid: isTextValue);
 
-    if (applied.isEmpty || !mounted) return false;
-    setState(() {});
-    showDialog<void>(
+    if (!mounted) return false;
+
+    final technicalKeys = <String>{
+      'extraction_target',
+      'document_type',
+      'validation_method',
+      'matched_keyword',
+      'ocr_text_found',
+    };
+    final detected = <String, String>{};
+    for (final entry in data.entries) {
+      if (technicalKeys.contains(entry.key) || entry.value == null) continue;
+      final rawValue = entry.value;
+      if (rawValue is! String && rawValue is! Iterable) continue;
+      final text = rawValue is Iterable
+          ? rawValue.whereType<Object>().join(', ').trim()
+          : rawValue.toString().trim();
+      if (text.isNotEmpty && text != 'null') detected[entry.key] = text;
+    }
+
+    final confirmed = await showDialog<bool>(
       context: context,
+      barrierDismissible: false,
       builder: (dialogContext) => AlertDialog(
-        title: Text(widget.isTagalog ? 'Suriin ang na-extract na detalye' : 'Review extracted details'),
+        title: Text(
+          widget.isTagalog
+              ? 'Suriin ang Na-extract na Detalye'
+              : 'Review Extracted Details',
+        ),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -5135,11 +5280,44 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             children: [
               Text(
                 widget.isTagalog
-                    ? 'Napunan ang mga sumusunod na bakanteng field mula sa ${_data.requirements[requirementIndex]}. Maaari mo pa itong baguhin sa form bago isumite.'
-                    : 'The following empty fields were filled from ${_data.requirements[requirementIndex]}. You can still edit them in the form before submitting.',
+                    ? 'Suriin ang lahat ng detalyeng nabasa mula sa ${_data.requirements[requirementIndex]}. Walang mababago sa form hangga\'t hindi mo ito kinukumpirma.'
+                    : 'Review all details read from ${_data.requirements[requirementIndex]}. Nothing is added to the form until you confirm.',
               ),
               const SizedBox(height: 12),
-              ...applied.entries.map(
+              Text(
+                widget.isTagalog ? 'Mga na-detect na detalye' : 'Detected details',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              if (detected.isEmpty)
+                Text(
+                  widget.isTagalog
+                      ? 'Walang malinaw na detalyeng nakuha mula sa dokumento.'
+                      : 'No clear details were extracted from this document.',
+                )
+              else
+                ...detected.entries.map(
+                  (entry) => Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text('${_formatOcrKey(entry.key)}: ${entry.value}'),
+                  ),
+                ),
+              const SizedBox(height: 12),
+              Text(
+                widget.isTagalog
+                    ? 'Mga field na pupunan'
+                    : 'Fields to auto-fill',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              if (proposed.isEmpty)
+                Text(
+                  widget.isTagalog
+                      ? 'Walang tugmang bakanteng field na ligtas na mapupunan.'
+                      : 'No matching empty form fields can be safely auto-filled.',
+                )
+              else
+                ...proposed.entries.map(
                 (entry) => Padding(
                   padding: const EdgeInsets.only(bottom: 6),
                   child: Text('${entry.key}: ${entry.value}'),
@@ -5150,14 +5328,47 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: Text(widget.isTagalog ? 'Suriin ang Form' : 'Review Form'),
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(
+              widget.isTagalog
+                  ? 'Kanselahin / Huwag Auto-Fill'
+                  : 'Cancel / Do Not Auto-Fill',
+            ),
+          ),
+          FilledButton(
+            onPressed: proposed.isEmpty
+                ? null
+                : () => Navigator.of(dialogContext).pop(true),
+            child: Text(
+              widget.isTagalog
+                  ? 'Kumpirmahin at Auto-Fill'
+                  : 'Confirm and Auto-Fill',
+            ),
           ),
         ],
       ),
     );
+    if (confirmed != true || !mounted) return false;
+
+    setState(() {
+      proposed.forEach((field, value) {
+        final controller = _controllers[field];
+        // Recheck the field just before writing, in case the form changed
+        // while the review dialog was visible.
+        if (controller != null && controller.text.trim().isEmpty) {
+          controller.text = value;
+        }
+      });
+    });
     return true;
   }
+
+  String _formatOcrKey(String key) => key
+      .replaceAll('_', ' ')
+      .split(' ')
+      .where((word) => word.isNotEmpty)
+      .map((word) => word[0].toUpperCase() + word.substring(1))
+      .join(' ');
 
   List<TimeOfDay> _standardBookingTimeSlots([DateTime? date]) {
     final bookingDate = date ?? DateTime.tryParse(_selectedScheduleDate());
