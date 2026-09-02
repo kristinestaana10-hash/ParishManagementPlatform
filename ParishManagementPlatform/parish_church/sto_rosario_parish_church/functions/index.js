@@ -915,6 +915,57 @@ async function validateMassIntentionSchedule(db, date, time) {
 
 // =========================================================================
 
+async function sendInvoiceEmail({
+  to,
+  donorName,
+  amount,
+  invoiceUrl,
+  referenceId,
+  invoiceType = 'Donation',
+}) {
+  const smtpUser = SMTP_USER.value();
+  const smtpPass = SMTP_APP_PASSWORD.value();
+  const fromName = SMTP_FROM_NAME.value() || 'Sto. Rosario Parish Church';
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: smtpUser, pass: smtpPass },
+  });
+  const formattedAmount = formatPhp(amount);
+  await transporter.sendMail({
+    from: `${fromName} <${smtpUser}>`,
+    to,
+    subject: `${invoiceType} Invoice - Sto. Rosario Parish Church`,
+    text: [
+      `Hello ${donorName},`,
+      '',
+      `Thank you for initiating a ${invoiceType.toLowerCase()}.`,
+      `Amount: ${formattedAmount}`,
+      `Reference ID: ${referenceId}`,
+      `Payment Link: ${invoiceUrl}`,
+    ].join('\n'),
+    html: `
+      <div style="font-family:Arial,sans-serif;background:${EMAIL_BRAND.bg};padding:24px;color:${EMAIL_BRAND.text};">
+        <div style="max-width:640px;margin:0 auto;background:#ffffff;border:1px solid ${EMAIL_BRAND.border};border-radius:12px;overflow:hidden;">
+          <div style="background:${EMAIL_BRAND.darkBlue};padding:20px 24px;">
+            <div style="font-size:18px;font-weight:700;color:#ffffff;">Sto. Rosario Parish Church</div>
+            <div style="font-size:13px;color:${EMAIL_BRAND.gold};margin-top:4px;">${escapeHtml(invoiceType)} Information</div>
+          </div>
+          <div style="padding:24px;">
+            <p style="margin:0 0 12px;">Hello <strong>${escapeHtml(donorName)}</strong>,</p>
+            <p style="margin:0 0 18px;line-height:1.6;">Thank you for your ${escapeHtml(invoiceType.toLowerCase())}. Here is the information for your record.</p>
+            <div style="height:4px;background:${EMAIL_BRAND.gold};margin:0 0 18px;"></div>
+            <div style="background:${EMAIL_BRAND.bg};border:1px solid ${EMAIL_BRAND.border};border-radius:8px;padding:16px;line-height:1.8;">
+              <div><span style="color:${EMAIL_BRAND.muted};">Amount:</span> <strong>${escapeHtml(formattedAmount)}</strong></div>
+              <div><span style="color:${EMAIL_BRAND.muted};">Reference ID:</span> ${escapeHtml(referenceId)}</div>
+              <div><span style="color:${EMAIL_BRAND.muted};">Payment information:</span> ${escapeHtml(invoiceUrl)}</div>
+            </div>
+            <p style="margin:18px 0 0;color:${EMAIL_BRAND.muted};font-size:12px;line-height:1.6;">Please keep this email for your records. You may use the payment information above to complete your transaction.</p>
+          </div>
+        </div>
+      </div>`,
+  });
+}
+
 async function sendReceiptEmail({
   to,
   donorName,
@@ -1495,6 +1546,21 @@ exports.createXenditDonationInvoice = onCall(
         },
       });
 
+      if (isValidEmail(donorEmail)) {
+        try {
+          await sendInvoiceEmail({
+            to: donorEmail,
+            donorName,
+            amount: amountNumber,
+            invoiceUrl,
+            referenceId: structuredId,
+            invoiceType: 'Donation',
+          });
+        } catch (emailErr) {
+          console.error('Error sending donation invoice email:', emailErr?.message);
+        }
+      }
+
       return {
         donationId: donationRef.id,
         checkoutUrl: invoiceUrl,
@@ -1612,6 +1678,21 @@ exports.createXenditMassOfferingInvoice = onCall(
           status: invoiceStatus.toLowerCase(),
         },
       });
+
+      if (isValidEmail(donorEmail)) {
+        try {
+          await sendInvoiceEmail({
+            to: donorEmail,
+            donorName,
+            amount: amountNumber,
+            invoiceUrl,
+            referenceId: structuredId,
+            invoiceType: 'Mass Offering',
+          });
+        } catch (emailErr) {
+          console.error('Error sending mass offering invoice email:', emailErr?.message);
+        }
+      }
 
       return {
         donationId: offeringRef.id,
@@ -2343,6 +2424,21 @@ exports.createXenditBookingInvoice = onCall(
         },
         { merge: true }
       );
+
+      if (isValidEmail(userEmail)) {
+        try {
+          await sendInvoiceEmail({
+            to: userEmail,
+            donorName: userName,
+            amount: amountNumber,
+            invoiceUrl,
+            referenceId: bookingRef.id,
+            invoiceType: `${sacramentType} Booking`,
+          });
+        } catch (emailErr) {
+          console.error('Error sending booking invoice email:', emailErr?.message);
+        }
+      }
 
       return {
         bookingId: bookingRef.id,

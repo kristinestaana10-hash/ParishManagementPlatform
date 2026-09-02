@@ -1035,9 +1035,8 @@ class DocumentValidationService {
                     {'type': 'DOCUMENT_TEXT_DETECTION', 'maxResults': 1},
                   ],
                   'imageContext': {
-                    'languageHints': ['en', 'tl'],
+                    'languageHints': ['en', 'fil', 'tl'],
                   },
-                  'pages': [1],
                 }
               : {
                   'image': {'content': base64Image},
@@ -1045,7 +1044,7 @@ class DocumentValidationService {
                     {'type': 'DOCUMENT_TEXT_DETECTION', 'maxResults': 1},
                   ],
                   'imageContext': {
-                    'languageHints': ['en', 'tl'],
+                    'languageHints': ['en', 'fil', 'tl'],
                   },
                 },
         ],
@@ -1086,14 +1085,31 @@ class DocumentValidationService {
         }
 
         if (responses != null && responses.isNotEmpty) {
-          final firstResponse = responses[0] as Map<String, dynamic>?;
+          final pageResponses = responses
+              .whereType<Map<String, dynamic>>()
+              .toList(growable: false);
+          if (pageResponses.isEmpty) {
+            return const _DocumentOcrResult(
+              text: '',
+              qualityIssues: [],
+              warnings: [],
+              qualityScore: 0.0,
+              qualityData: {'ocr_text_found': false},
+            );
+          }
+          final firstResponse = pageResponses.first;
           final qualityResult = _evaluateOcrQuality(firstResponse);
 
-          // Try DOCUMENT_TEXT_DETECTION first
-          final fullTextAnnotation = firstResponse?['fullTextAnnotation'];
-          if (fullTextAnnotation != null &&
-              fullTextAnnotation['text'] != null) {
-            final extractedText = fullTextAnnotation['text'] as String;
+          // PDFs can have more than one OCR response. Combine all readable
+          // pages so a required field on a later page is not silently missed.
+          final fullText = pageResponses
+              .map((page) => page['fullTextAnnotation'])
+              .whereType<Map<String, dynamic>>()
+              .map((annotation) => annotation['text']?.toString() ?? '')
+              .where((text) => text.trim().isNotEmpty)
+              .join('\n');
+          if (fullText.isNotEmpty) {
+            final extractedText = fullText;
             print(
               'DEBUG: Document text extracted: ${extractedText.substring(0, extractedText.length > 100 ? 100 : extractedText.length)}...',
             );
@@ -1107,7 +1123,7 @@ class DocumentValidationService {
           }
 
           // Fallback to textAnnotations
-          final textAnnotations = firstResponse?['textAnnotations'] as List?;
+          final textAnnotations = firstResponse['textAnnotations'] as List?;
           if (textAnnotations != null && textAnnotations.isNotEmpty) {
             final extractedText = textAnnotations
                 .map((annotation) => annotation['text'] as String?)
@@ -1129,7 +1145,7 @@ class DocumentValidationService {
           }
 
           // Try TEXT_DETECTION as last resort
-          final textDetections = firstResponse?['textAnnotations'] as List?;
+          final textDetections = firstResponse['textAnnotations'] as List?;
           if (textDetections != null && textDetections.isNotEmpty) {
             final extractedText = textDetections
                 .map((detection) => detection['description'] as String?)
@@ -1555,29 +1571,45 @@ class DocumentValidationService {
   ) async {
     final data = <String, dynamic>{};
 
+    // A requirement is the extraction target.  This prevents a document from
+    // being treated as a generic block of text and lets the form safely use
+    // birth-certificate fields only when a birth certificate was uploaded.
+    final isBirthCertificate = requirementType.toLowerCase().contains('birth') ||
+        requirementType.toLowerCase().contains('kapanganakan');
+    data['extraction_target'] =
+        isBirthCertificate ? 'birth_certificate' : 'general_document';
+
     // Extract common fields
     final fatherName = _extractLabeledValue(extractedText, [
-      "father(?:'s name)?",
+      "father(?:'s)?(?: (?:full )?name)?",
       'name of father',
+      'father name',
+      'pangalan ng ama',
       'ama',
     ]);
     final motherName = _extractLabeledValue(extractedText, [
-      "mother(?:'s maiden name|'s name)?",
+      "mother(?:'s)?(?: maiden)?(?: name)?",
       'name of mother',
+      'mother name',
+      'pangalan ng ina',
       'ina',
     ]);
-    data['full_name'] = _extractChildName(extractedText);
-    data['date_of_birth'] = _extractBirthDate(extractedText);
-    data['place_of_birth'] = _extractLabeledValue(extractedText, [
-      'place of (?:birth|occurrence)',
-      'born in',
-      'lugar ng kapanganakan',
-    ]);
-    data['father_name'] = fatherName;
-    data['mother_name'] = motherName;
-    data['parent_names'] = [fatherName, motherName]
-        .where((name) => name.isNotEmpty)
-        .join(', ');
+    if (isBirthCertificate) {
+      data['full_name'] = _extractChildName(extractedText);
+      data['date_of_birth'] = _extractBirthDate(extractedText);
+      data['place_of_birth'] = _extractLabeledValue(extractedText, [
+        'place of (?:birth|occurrence)',
+        'born in',
+        'place/lugar of birth',
+        'lugar ng kapanganakan',
+        'pook ng kapanganakan',
+      ]);
+      data['father_name'] = fatherName;
+      data['mother_name'] = motherName;
+      data['parent_names'] = [fatherName, motherName]
+          .where((name) => name.isNotEmpty)
+          .join(', ');
+    }
 
     // Extract sacrament-specific fields
     switch (sacramentType.toLowerCase()) {
@@ -1693,8 +1725,13 @@ class DocumentValidationService {
       'name of (?:the )?child',
       "child(?:'s)? name",
       'name of registrant',
+      'name of infant',
+      'name of baby',
+      'name of person',
+      'complete name',
       'full name',
       'pangalan ng bata',
+      'buong pangalan',
       'pangalan',
       'name',
     ]);
@@ -1704,6 +1741,8 @@ class DocumentValidationService {
     final labeled = _extractLabeledValue(text, [
       'date of (?:birth|occurrence)',
       'birth date',
+      'date born',
+      'birthday',
       'petsa ng kapanganakan',
     ], valueCanBeDate: true);
     if (labeled.isNotEmpty) return _normaliseDate(labeled);
@@ -1715,40 +1754,143 @@ class DocumentValidationService {
     List<String> labels, {
     bool valueCanBeDate = false,
   }) {
+    // Vision normally keeps lines, but a scan can place table headings and
+    // values on one line or separate them with irregular whitespace. Search
+    // by nearby labels instead of assuming a fixed certificate position.
+    final candidates = <String>[];
     for (final label in labels) {
+      // OCR can split a printed label across lines or insert extra spaces in
+      // a table cell; allow whitespace anywhere a label contains a space.
+      final flexibleLabel = label.replaceAll(' ', r'\s+');
       final pattern = RegExp(
-        '(?:^|\\n|\\r)\\s*(?:$label)\\s*[:\\-]?\\s*([^\\n\\r]{2,100})',
+        '(?:^|\\n|\\b)(?:$flexibleLabel)\\b\\s*[:\\-–—.]?\\s*([^\\n]{2,120})',
         caseSensitive: false,
       );
-      final match = pattern.firstMatch(text);
-      if (match == null) continue;
-      var value = match.group(1)!.trim();
-      value = value.replaceFirst(RegExp(r'^[.:-\s]+'), '');
-      value = value.replaceFirst(
-        RegExp(r'\s+(?:sex|father|mother|place|date|citizenship)\b.*$',
-            caseSensitive: false),
-        '',
-      );
-      if (valueCanBeDate) {
-        final date = RegExp(
-          r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4})\b',
-          caseSensitive: false,
-        ).firstMatch(value);
-        return date?.group(0) ?? '';
+      for (final reading in _ocrReadingVariants(text)) {
+        for (final match in pattern.allMatches(reading)) {
+          var value = _cleanOcrFieldValue(match.group(1)!);
+          value = value.replaceFirst(
+            RegExp(
+                r'\s+(?:sex|gender|father|mother|place|date|citizenship|nationality|informant|attendant|legitimacy|type of birth)\b.*$',
+                caseSensitive: false),
+            '',
+          );
+          if (valueCanBeDate) {
+            final date = _firstDateIn(value);
+            if (date.isNotEmpty) candidates.add(date);
+          } else if (_isPlausibleOcrFieldValue(value)) {
+            candidates.add(value);
+          }
+        }
       }
-      if (value.length >= 2) return value;
     }
-    return '';
+    if (candidates.isEmpty) return '';
+    candidates.sort((a, b) => _ocrCandidateScore(b).compareTo(_ocrCandidateScore(a)));
+    return candidates.first;
+  }
+
+  /// Returns a few text readings for the same document. This makes extraction
+  /// tolerant of OCR that separates a table label and its value onto adjacent
+  /// lines, without depending on a particular PSA/LCR certificate layout.
+  static Iterable<String> _ocrReadingVariants(String text) sync* {
+    final normalized = text
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n')
+        .replaceAll(RegExp(r'[\t\f\v ]+'), ' ');
+    yield normalized;
+
+    final lines = normalized
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList(growable: false);
+    for (var index = 0; index + 1 < lines.length; index++) {
+      // A two-line window catches `DATE OF BIRTH` followed by its value.
+      yield '${lines[index]}\n${lines[index + 1]}';
+    }
+  }
+
+  static String _firstDateIn(String value) {
+    final corrected = value
+        .replaceAllMapped(
+          RegExp(r'(\d)[Oo](\d)'),
+          (match) => '${match.group(1)}0${match.group(2)}',
+        )
+        .replaceAllMapped(
+          RegExp(r'(\d)[Il](\d)'),
+          (match) => '${match.group(1)}1${match.group(2)}',
+        );
+    final date = RegExp(
+      r'\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2}[./-]\d{1,2}|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?),?\s+\d{4})\b',
+      caseSensitive: false,
+    ).firstMatch(corrected);
+    return date?.group(0) ?? '';
+  }
+
+  static bool _isPlausibleOcrFieldValue(String value) {
+    if (value.length < 2 || value.length > 100) return false;
+    final lowered = value.toLowerCase();
+    if (RegExp(
+      r'^(?:sex|gender|father|mother|place|date|citizenship|surname|first|middle|last|given|registry)\b',
+    ).hasMatch(lowered)) {
+      return false;
+    }
+    return RegExp(r'[A-Za-z]').hasMatch(value);
+  }
+
+  static int _ocrCandidateScore(String value) {
+    final words = value.split(RegExp(r'\s+')).length;
+    final letters = RegExp(r'[A-Za-z]').allMatches(value).length;
+    final digits = RegExp(r'\d').allMatches(value).length;
+    // Names and places normally have several words/letters; long runs of
+    // digits are usually registry numbers that must not fill a text field.
+    return (words * 10) + letters - (digits * 4) - (value.length > 80 ? 40 : 0);
+  }
+
+  static String _cleanOcrFieldValue(String value) {
+    return value
+        .replaceFirst(RegExp(r'^[.:-–—\s]+'), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .replaceAll(RegExp(r'\s+[|]\s*'), ' ')
+        .trim();
   }
 
   static String _normaliseDate(String value) {
-    final numeric = RegExp(r'^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$')
-        .firstMatch(value.trim());
-    if (numeric == null) return value.trim();
-    final year = numeric.group(3)!.length == 2
-        ? '19${numeric.group(3)}'
-        : numeric.group(3)!;
-    return '$year-${numeric.group(1)!.padLeft(2, '0')}-${numeric.group(2)!.padLeft(2, '0')}';
+    final trimmed = value.trim();
+    final numeric = RegExp(r'^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$')
+        .firstMatch(trimmed);
+    if (numeric != null) {
+      final year = numeric.group(3)!.length == 2
+          ? '19${numeric.group(3)}'
+          : numeric.group(3)!;
+      return '$year-${numeric.group(1)!.padLeft(2, '0')}-${numeric.group(2)!.padLeft(2, '0')}';
+    }
+
+    final months = <String, int>{
+      'jan': 1, 'january': 1, 'feb': 2, 'february': 2,
+      'mar': 3, 'march': 3, 'apr': 4, 'april': 4,
+      'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
+      'aug': 8, 'august': 8, 'sep': 9, 'sept': 9, 'september': 9,
+      'oct': 10, 'october': 10, 'nov': 11, 'november': 11,
+      'dec': 12, 'december': 12,
+    };
+    final monthFirst = RegExp(
+      r'^([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?[,]?\s+(\d{4})$',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    final dayFirst = RegExp(
+      r'^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)[,]?\s+(\d{4})$',
+      caseSensitive: false,
+    ).firstMatch(trimmed);
+    final month = monthFirst == null
+        ? (dayFirst == null ? null : months[dayFirst.group(2)!.toLowerCase()])
+        : months[monthFirst.group(1)!.toLowerCase()];
+    if (month != null) {
+      final day = monthFirst?.group(2) ?? dayFirst!.group(1)!;
+      final year = monthFirst?.group(3) ?? dayFirst!.group(3)!;
+      return '$year-${month.toString().padLeft(2, '0')}-${day.padLeft(2, '0')}';
+    }
+    return trimmed;
   }
 
   static String _extractFullName(String text) {

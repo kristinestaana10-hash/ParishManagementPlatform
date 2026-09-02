@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -611,6 +613,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   bool _hasShownBookingAssistant = false;
   bool _isBookingAssistantOpen = false;
   List<String> _massScheduleTexts = [];
+  StreamSubscription? _massScheduleSubscription;
   final List<Map<String, TextEditingController>> _additionalGodparents = [];
   final Map<int, PlatformFile?> _uploadedRequirementImages =
       {}; // Track uploaded images per requirement
@@ -639,9 +642,123 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     if (widget.sacramentType != SacramentType.massIntention) {
       _bookingCountsLoadFuture = _preloadBookingCounts();
     }
-    if (widget.sacramentType == SacramentType.massIntention) {
-      _loadMassIntentionSchedule();
+    // Regular booking-time dropdowns and Mass Intentions both depend on the
+    // current parish Mass schedule.  Keep this live so an admin's schedule
+    // change is reflected without returning to the form or using fixed slots.
+    _loadMassIntentionSchedule();
+    _listenForMassScheduleChanges();
+  }
+
+  List<String> _massScheduleTextsFromProfile(dynamic profile) {
+    if (profile == null) return const [];
+    return profile.massSchedule
+        .map((item) {
+          final label = item.label(widget.isTagalog).trim();
+          final time = item.time.trim();
+          if (label.isEmpty) return time;
+          if (time.isEmpty || label == time) return label;
+          return '$label at $time';
+        })
+        .where((item) => item.trim().isNotEmpty)
+        .toList();
+  }
+
+  /// Reads the source field used by the parish profile editor. Keeping this
+  /// separate from the display model also supports the existing `schedule`
+  /// map/list formats stored in Firestore.
+  List<String> _massScheduleTextsFromProfileData(Map<String, dynamic> data) {
+    final texts = <String>[];
+
+    void addFrom(dynamic value, {String day = ''}) {
+      if (value == null) return;
+      if (value is String) {
+        final text = [day, value.trim()]
+            .where((part) => part.isNotEmpty)
+            .join(' at ');
+        if (text.isNotEmpty) texts.add(text);
+        return;
+      }
+      if (value is List) {
+        for (final item in value) {
+          addFrom(item, day: day);
+        }
+        return;
+      }
+      if (value is! Map) return;
+
+      final map = Map<String, dynamic>.from(value);
+      for (final key in [
+        'massSchedule',
+        'mass_schedule',
+        'massSchedules',
+        'schedule',
+      ]) {
+        if (map.containsKey(key)) {
+          addFrom(map[key], day: day);
+          return;
+        }
+      }
+
+      final itemDay = (map['day'] ??
+              map['englishDay'] ??
+              map['tagalogDay'] ??
+              map['label'] ??
+              day)
+          .toString()
+          .trim();
+      final time = (map['time'] ??
+              map['timeString'] ??
+              map['scheduleTime'] ??
+              map['startTime'])
+          ?.toString()
+          .trim();
+      if (time != null && time.isNotEmpty) {
+        addFrom(time, day: itemDay);
+        return;
+      }
+
+      // Also support a schedule map such as {"Monday": "9:00 AM"}.
+      for (final entry in map.entries) {
+        final label = entry.key == 'daily' || entry.key == 'sunday'
+            ? entry.key
+            : itemDay.isEmpty
+                ? entry.key
+                : itemDay;
+        addFrom(entry.value, day: label);
+      }
     }
+
+    addFrom(data['massSchedule'] ??
+        data['mass_schedule'] ??
+        data['massSchedules'] ??
+        data['schedule']);
+    return texts.toSet().toList();
+  }
+
+  void _listenForMassScheduleChanges() {
+    _massScheduleSubscription = FirebaseFirestore.instance
+        .collection('parish_profile')
+        .doc('main')
+        .snapshots()
+        .listen((snapshot) {
+      if (!mounted || !snapshot.exists) return;
+      final updatedSchedule =
+          _massScheduleTextsFromProfileData(snapshot.data() ?? const {});
+      if (updatedSchedule.isEmpty) return;
+
+      setState(() {
+        _massScheduleTexts = updatedSchedule;
+        // Previously calculated availability used the old Mass schedule.
+        _availableStandardSlotsByDate.clear();
+      });
+
+      final selectedDate = _selectedScheduleDate();
+      if (selectedDate.isNotEmpty) {
+        _refreshStandardSlotAvailability(selectedDate);
+      }
+    }, onError: (Object error) {
+      debugPrint('Error listening for Mass schedule changes: $error');
+    });
   }
 
   /// Pre-load booking counts for the next 365 days to support date disabling
@@ -704,8 +821,12 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         }
       }
 
-      await countCollection('bookings');
-      await countCollection('sacrament_requests');
+      // Both collections are independent. Loading them concurrently shortens
+      // the cold-start wait before the assistant can use this cache.
+      await Future.wait([
+        countCollection('bookings'),
+        countCollection('sacrament_requests'),
+      ]);
 
       _bookingCountCache.clear();
       for (int i = 0; i <= endDate.difference(startDate).inDays; i++) {
@@ -738,23 +859,28 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       final profile = await FirebaseService.instance.getParishProfile();
       if (!mounted) return;
 
-      final scheduleTexts = <String>[
-        ...?profile?.massSchedule
-            .map((item) {
-              final label = item.label(widget.isTagalog).trim();
-              final time = item.time.trim();
-              if (label.isEmpty) return time;
-              if (time.isEmpty || label == time) return label;
-              return '$label at $time';
-            })
-            .where((item) => item.trim().isNotEmpty),
-        ...await _loadMassScheduleTextsFromFirestore(),
-      ];
+      final scheduleTexts = <String>[..._massScheduleTextsFromProfile(profile)];
+      // `schedule` is the field maintained by the parish profile editor.
+      // Read its raw value as well because older profiles use a map instead
+      // of the newer `massSchedule` list.
+      final profileSnapshot = await FirebaseFirestore.instance
+          .collection('parish_profile')
+          .doc('main')
+          .get();
+      if (profileSnapshot.exists) {
+        scheduleTexts.addAll(
+          _massScheduleTextsFromProfileData(profileSnapshot.data() ?? const {}),
+        );
+      }
 
       setState(() {
         _massScheduleTexts = scheduleTexts.toSet().toList();
         _massScheduleLoading = false;
       });
+      final selectedDate = _selectedScheduleDate();
+      if (selectedDate.isNotEmpty) {
+        await _refreshStandardSlotAvailability(selectedDate);
+      }
     } catch (e) {
       debugPrint('Error loading Mass Intention schedule: $e');
       if (mounted) {
@@ -1310,6 +1436,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
 
   @override
   void dispose() {
+    _massScheduleSubscription?.cancel();
     for (final controller in _controllers.values) {
       controller.dispose();
     }
@@ -2806,10 +2933,22 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     required int month,
     required int year,
   }) async {
+    // The calendar preload already retrieves and counts active bookings for the
+    // next year. Reusing it prevents the assistant from reading both booking
+    // collections a second time every time suggestions are opened.
+    if (_bookingCountsLoaded) {
+      final monthPrefix = '$year-${month.toString().padLeft(2, '0')}-';
+      return _bookingCountCache.entries
+          .where((entry) =>
+              entry.key.startsWith(monthPrefix) && entry.value > 0)
+          .map((entry) => entry.key)
+          .toSet();
+    }
+
     final bookedDates = <String>{};
     final monthPrefix = '$year-${month.toString().padLeft(2, '0')}-';
 
-    for (final collection in ['bookings', 'sacrament_requests']) {
+    Future<void> readCollection(String collection) async {
       try {
         Query<Map<String, dynamic>> query = FirebaseFirestore.instance
             .collection(collection);
@@ -2847,13 +2986,23 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           debugPrint(
             'AI Booking Assistant: direct bookings read failed, using availability fallback: $e',
           );
-          return null;
+          rethrow;
         } else {
           debugPrint(
             'AI Booking Assistant: could not read $collection for recommendations: $e',
           );
         }
       }
+    }
+
+    try {
+      // These independent reads have no reason to wait for each other.
+      await Future.wait([
+        readCollection('bookings'),
+        readCollection('sacrament_requests'),
+      ]);
+    } catch (_) {
+      return null;
     }
 
     return bookedDates;
@@ -3072,12 +3221,16 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       year: year,
     );
     const maxRecommendedDates = 5;
+    final recommendedDateValues = <String>{};
 
     for (
       var date = searchStart;
       !date.isAfter(searchEnd);
       date = date.add(const Duration(days: 1))
     ) {
+      // A recommendation needs one viable time per date. Once we have enough
+      // dates, checking the rest of the month only adds network latency.
+      if (recommendedDateValues.length >= maxRecommendedDates) break;
       final dateValue = _assistantDateValue(date);
       if (excludedDates.contains(dateValue)) continue;
       if (!_matchesAssistantDayPreference(date, dayPreference)) continue;
@@ -3111,23 +3264,10 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             )) {
           continue;
         }
-        var isMassBlocked = false;
-        try {
-          isMassBlocked = await _isBlockedByMassSchedule(
-            date: dateValue,
-            time: time,
-          );
-        } catch (e) {
-          debugPrint(
-            'AI Booking Assistant: Mass schedule check failed for $dateValue $time: $e',
-          );
-        }
-        if (isMassBlocked) {
-          continue;
-        }
-
         if (widget.sacramentType != SacramentType.massIntention) {
           try {
+            // The conflict function includes the Mass-schedule test. Keeping
+            // it as the single remote validation avoids duplicate reads.
             final conflict = await FirebaseService.instance
                 .checkSchedulingConflictWithFunction(
                   sacramentType: sacramentTypeLabel,
@@ -3168,6 +3308,10 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             recommendation: recommendation,
           ),
         );
+        recommendedDateValues.add(dateValue);
+        // Candidate times are ordered by the user's preference, so the first
+        // valid one is the best slot for this date.
+        break;
       }
     }
 
@@ -3211,12 +3355,14 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       );
 
       final fallbackSlots = <_BookingAssistantSlot>[];
+      final fallbackDateValues = <String>{};
 
       for (
         var date = searchStart;
         !date.isAfter(searchEnd);
         date = date.add(const Duration(days: 1))
       ) {
+        if (fallbackDateValues.length >= maxRecommendedDates) break;
         final dateValue = _assistantDateValue(date);
         if (excludedDates.contains(dateValue)) continue;
         if (!_matchesAssistantDayPreference(date, dayPreference)) continue;
@@ -3248,19 +3394,6 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
               )) {
             continue;
           }
-          var isMassBlocked = false;
-          try {
-            isMassBlocked = await _isBlockedByMassSchedule(
-              date: dateValue,
-              time: time,
-            );
-          } catch (e) {
-            debugPrint(
-              'AI Booking Assistant: Mass schedule check failed for $dateValue $time: $e',
-            );
-          }
-          if (isMassBlocked) continue;
-
           if (widget.sacramentType != SacramentType.massIntention) {
             try {
               final conflict = await FirebaseService.instance
@@ -3298,6 +3431,8 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
               recommendation: recommendation,
             ),
           );
+          fallbackDateValues.add(dateValue);
+          break;
         }
       }
 
@@ -3932,13 +4067,13 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     if (text.contains('daily') || text.contains('everyday')) return true;
 
     const names = {
-      DateTime.monday: ['monday', 'mon'],
-      DateTime.tuesday: ['tuesday', 'tue'],
-      DateTime.wednesday: ['wednesday', 'wed'],
-      DateTime.thursday: ['thursday', 'thu'],
-      DateTime.friday: ['friday', 'fri'],
-      DateTime.saturday: ['saturday', 'sat'],
-      DateTime.sunday: ['sunday', 'sun'],
+      DateTime.monday: ['monday', 'mon', 'lunes'],
+      DateTime.tuesday: ['tuesday', 'tue', 'martes'],
+      DateTime.wednesday: ['wednesday', 'wed', 'miyerkules'],
+      DateTime.thursday: ['thursday', 'thu', 'huwebes'],
+      DateTime.friday: ['friday', 'fri', 'biyernes'],
+      DateTime.saturday: ['saturday', 'sat', 'sabado'],
+      DateTime.sunday: ['sunday', 'sun', 'linggo'],
     };
 
     final mentionedDays = names.entries
@@ -4918,6 +5053,16 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   ) {
     final data = result.extractedData;
     final applied = <String, String>{};
+    final isBirthCertificate =
+        data['extraction_target'] == 'birth_certificate' ||
+        (data['document_type'] ?? '').toString().toLowerCase().contains('birth');
+    if (!isBirthCertificate) return false;
+    final requirement = _data.requirements[requirementIndex].toLowerCase();
+    final subject = requirement.contains('groom')
+        ? 'groom'
+        : requirement.contains('bride')
+        ? 'bride'
+        : '';
 
     String value(String key) => (data[key] ?? '').toString().trim();
 
@@ -4928,10 +5073,17 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       return null;
     }
 
-    void apply(String extractedKey, bool Function(String normalized) matches) {
+    void apply(
+      String extractedKey,
+      bool Function(String normalized) matches, {
+      bool preferCertificateSubject = false,
+    }) {
       final extracted = value(extractedKey);
       if (extracted.isEmpty) return;
-      final key = findField(matches);
+      final key = preferCertificateSubject && subject.isNotEmpty
+          ? (findField((field) => field.contains(subject) && matches(field)) ??
+              findField(matches))
+          : findField(matches);
       if (key == null) return;
       final controller = _controllers[key];
       if (controller != null && controller.text.trim().isEmpty) {
@@ -4951,7 +5103,8 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         !field.contains('godparent') &&
         !field.contains('ninong') &&
         !field.contains('ninang') &&
-        !field.contains('contact'));
+        !field.contains('contact'),
+        preferCertificateSubject: true);
     apply('date_of_birth',
         (field) =>
             (field.contains('date') || field.contains('petsa')) &&
@@ -5006,14 +5159,60 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     return true;
   }
 
-  List<TimeOfDay> _standardBookingTimeSlots() {
-    // Two morning sessions and two afternoon sessions, beginning at 1:00 PM.
-    return const [
-      TimeOfDay(hour: 8, minute: 0),
-      TimeOfDay(hour: 9, minute: 30),
-      TimeOfDay(hour: 13, minute: 0),
-      TimeOfDay(hour: 14, minute: 30),
-    ];
+  List<TimeOfDay> _standardBookingTimeSlots([DateTime? date]) {
+    final bookingDate = date ?? DateTime.tryParse(_selectedScheduleDate());
+    if (bookingDate == null) return const [];
+
+    // Each booking and Mass reserves a 90-minute interval. Generate each
+    // booking slot around the Mass intervals rather than exposing Mass times
+    // themselves as bookable options.
+    const slotLengthMinutes = 90;
+    final massStarts = <int>[];
+    for (final scheduleText in _massScheduleTexts) {
+      if (!_scheduleTextAppliesToDate(scheduleText, bookingDate)) continue;
+      for (final time in _extractMassTimesFromText(scheduleText)) {
+        final minutes = time.hour * 60 + time.minute;
+        if (!massStarts.contains(minutes)) massStarts.add(minutes);
+      }
+    }
+    if (massStarts.isEmpty) return const [];
+    massStarts.sort();
+
+    bool overlapsMass(int start) => massStarts.any((massStart) {
+          final end = start + slotLengthMinutes;
+          final massEnd = massStart + slotLengthMinutes;
+          return start < massEnd && end > massStart;
+        });
+
+    int nextAvailableStart(int preferredStart) {
+      var candidate = preferredStart;
+      while (overlapsMass(candidate)) {
+        final overlappingMassEnds = massStarts
+            .where((massStart) =>
+                candidate < massStart + slotLengthMinutes &&
+                candidate + slotLengthMinutes > massStart)
+            .map((massStart) => massStart + slotLengthMinutes);
+        candidate = overlappingMassEnds.reduce(
+          (latest, value) => value > latest ? value : latest,
+        );
+      }
+      return candidate;
+    }
+
+    // These are session windows, not booking-time values: two slots are
+    // generated in the morning window and two in the afternoon window. Each
+    // candidate moves forward only when a current Mass interval blocks it.
+    const morningWindowStart = 8 * 60;
+    const afternoonWindowStart = 14 * 60;
+    final firstMorning = nextAvailableStart(morningWindowStart);
+    final secondMorning = nextAvailableStart(firstMorning + slotLengthMinutes);
+    final firstAfternoon = nextAvailableStart(afternoonWindowStart);
+    final secondAfternoon =
+        nextAvailableStart(firstAfternoon + slotLengthMinutes);
+
+    return [firstMorning, secondMorning, firstAfternoon, secondAfternoon]
+        .map((minutes) => TimeOfDay(hour: minutes ~/ 60, minute: minutes % 60))
+        .toList(growable: false);
   }
 
   Future<void> _refreshStandardSlotAvailability(String date) async {
@@ -5030,7 +5229,9 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     } else {
       _standardSlotAvailabilityLoadingDates.add(date);
     }
-    final allSlots = _standardBookingTimeSlots().map(_formatTimeOfDay).toList();
+    final allSlots = _standardBookingTimeSlots(DateTime.tryParse(date))
+        .map(_formatTimeOfDay)
+        .toList();
     try {
       final availableSlots = await FirebaseService.instance.getAvailableTimeSlots(
         date: date,

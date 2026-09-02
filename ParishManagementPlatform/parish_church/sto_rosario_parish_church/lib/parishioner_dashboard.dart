@@ -98,15 +98,20 @@ class ParishionerDashboard extends StatefulWidget {
 class _ParishionerDashboardState extends State<ParishionerDashboard> {
   int _currentNavIndex = 0;
   int _bookingsCount = 0;
+  int _notificationCount = 0;
   bool _isLanguageTagalog = false;
+  List<Map<String, dynamic>> _notifications = [];
 
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>?
   _bookingsSubscription;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>?
+  _donationDrivesSubscription;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
   @override
   void initState() {
     super.initState();
+    _loadNotifications();
     if (!_isGuest) {
       _bookingsSubscription = FirebaseService.instance
           .userBookingsStream()
@@ -118,9 +123,108 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
     }
   }
 
+  void _loadNotifications() {
+    // Listen to donation drives
+    _donationDrivesSubscription = FirebaseFirestore.instance
+        .collection('donation_drives')
+        .orderBy('createdAt', descending: true)
+        .limit(10)
+        .snapshots()
+        .listen((snapshot) {
+      _updateNotifications();
+    });
+  }
+
+  void _updateNotifications() {
+    _notifications.clear();
+
+    // Fetch recent donation drives (last 7 days)
+    FirebaseFirestore.instance
+        .collection('donation_drives')
+        .orderBy('createdAt', descending: true)
+        .limit(10)
+        .get()
+        .then((driveSnapshot) {
+      final now = DateTime.now();
+      for (var doc in driveSnapshot.docs) {
+        final data = doc.data();
+        final createdAt = (data['createdAt'] is Timestamp)
+            ? (data['createdAt'] as Timestamp).toDate()
+            : DateTime.now();
+
+        // Include drives from last 7 days
+        if (now.difference(createdAt).inDays <= 7) {
+          _notifications.add({
+            'type': 'donation_drive',
+            'id': doc.id,
+            'title': data['title'] ?? 'Donation Drive',
+            'description': data['description'] ?? '',
+            'createdAt': createdAt,
+            'icon': Icons.volunteer_activism,
+            'color': ParishColors.primaryGold,
+          });
+        }
+      }
+
+      // Fetch user's recent bookings with status changes
+      if (!_isGuest) {
+        FirebaseService.instance.userBookingsStream().first.then((bookingSnapshot) {
+          final now = DateTime.now();
+          for (var doc in bookingSnapshot.docs) {
+            final data = doc.data();
+            final bookingDate = (data['createdAt'] is Timestamp)
+                ? (data['createdAt'] as Timestamp).toDate()
+                : DateTime.now();
+
+            // Include recent bookings (last 7 days)
+            if (now.difference(bookingDate).inDays <= 7) {
+              final status = data['status'] ?? 'pending';
+              _notifications.add({
+                'type': 'booking',
+                'id': doc.id,
+                'title': _t('Booking Update', 'Booking Update'),
+                'description':
+                    '${data['sacrament'] ?? 'Sacrament'} - ${_t(_getStatusTagalog(status), status)}',
+                'createdAt': bookingDate,
+                'icon': Icons.check_circle,
+                'color': status == 'confirmed'
+                    ? ParishColors.greenSuccess
+                    : ParishColors.primaryBlue,
+              });
+            }
+          }
+
+          setState(() {
+            _notificationCount = _notifications.length;
+          });
+        });
+      } else {
+        setState(() {
+          _notificationCount = _notifications.length;
+        });
+      }
+    });
+  }
+
+  String _getStatusTagalog(String status) {
+    switch (status.toLowerCase()) {
+      case 'confirmed':
+        return 'Nakumpirma';
+      case 'pending':
+        return 'Naghihintay';
+      case 'cancelled':
+        return 'Kinansela';
+      case 'completed':
+        return 'Tapos na';
+      default:
+        return status;
+    }
+  }
+
   @override
   void dispose() {
     _bookingsSubscription?.cancel();
+    _donationDrivesSubscription?.cancel();
     super.dispose();
   }
 
@@ -142,7 +246,7 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
         onNotificationPressed: _showNotifications,
         onLanguagePressed: _toggleLanguage,
         onLogoutPressed: _logout,
-        notificationCount: 3,
+        notificationCount: _notificationCount,
         userName: widget.userName,
         userStatus: _isGuest
             ? (_isLanguageTagalog ? 'Bisita' : 'Guest')
@@ -531,7 +635,179 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
   }
 
   void _showNotifications() {
-    _showModalNotification(_t('Walang bagong abiso', 'No new notifications'));
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) => Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 500, maxHeight: 600),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Column(
+            children: [
+              // Header
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  gradient: ParishGradients.blueHeroGradient,
+                  borderRadius: const BorderRadius.only(
+                    topLeft: Radius.circular(20),
+                    topRight: Radius.circular(20),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.notifications_active,
+                      color: Colors.white,
+                      size: 28,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _t('Mga Abiso', 'Notifications'),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                  ],
+                ),
+              ),
+              // Notifications List
+              Expanded(
+                child: _notifications.isEmpty
+                    ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(32),
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.notifications_off_outlined,
+                                size: 64,
+                                color: Colors.grey[300],
+                              ),
+                              const SizedBox(height: 16),
+                              Text(
+                                _t('Walang bagong abiso', 'No new notifications'),
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  color: Colors.grey[500],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      )
+                    : ListView.separated(
+                        padding: const EdgeInsets.all(12),
+                        itemCount: _notifications.length,
+                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final notification = _notifications[index];
+                          final createdAt = notification['createdAt'] as DateTime;
+                          final now = DateTime.now();
+                          final diff = now.difference(createdAt);
+
+                          String timeAgo = '';
+                          if (diff.inMinutes < 1) {
+                            timeAgo = _t('Ngayon', 'Just now');
+                          } else if (diff.inMinutes < 60) {
+                            timeAgo = _t(
+                              '${diff.inMinutes} min na ang nakakaraan',
+                              '${diff.inMinutes} minutes ago',
+                            );
+                          } else if (diff.inHours < 24) {
+                            timeAgo = _t(
+                              '${diff.inHours} oras na ang nakakaraan',
+                              '${diff.inHours} hours ago',
+                            );
+                          } else {
+                            timeAgo = _t(
+                              '${diff.inDays} araw na ang nakakaraan',
+                              '${diff.inDays} days ago',
+                            );
+                          }
+
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(
+                              vertical: 12,
+                              horizontal: 8,
+                            ),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Container(
+                                  width: 50,
+                                  height: 50,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: (notification['color'] as Color)
+                                        .withValues(alpha: 0.2),
+                                  ),
+                                  child: Icon(
+                                    notification['icon'] as IconData,
+                                    color: notification['color'] as Color,
+                                    size: 24,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        notification['title'] as String,
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                          color: ParishColors.textBlue900,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        notification['description'] as String,
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 14,
+                                          color: Colors.grey[600],
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        timeAgo,
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.grey[400],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   void _showAIChat() {
