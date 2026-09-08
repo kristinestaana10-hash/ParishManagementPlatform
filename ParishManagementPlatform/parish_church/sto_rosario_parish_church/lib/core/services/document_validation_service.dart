@@ -798,12 +798,9 @@ class DocumentValidationService {
 
     // Check for exact template phrases
     int templatePhraseCount = 0;
-    List<String> foundPhrases = [];
-
     for (final phrase in templatePhrases) {
       if (upperText.contains(phrase.toUpperCase())) {
         templatePhraseCount++;
-        foundPhrases.add(phrase);
       }
     }
 
@@ -866,7 +863,6 @@ class DocumentValidationService {
     }
 
     print('DEBUG: Template phrases found: $templatePhraseCount/9');
-    print('DEBUG: Found phrases: $foundPhrases');
     print('DEBUG: Baptism indicator: $foundIndicator');
     print('DEBUG: Church indicator: $hasChurchIndicator');
     print('DEBUG: Baptism terms count: $baptismTermCount');
@@ -926,7 +922,6 @@ class DocumentValidationService {
           'baptism_indicator': foundIndicator,
           'church_indicator': hasChurchIndicator,
           'baptism_terms_count': baptismTermCount,
-          'found_phrases': foundPhrases,
         },
         errorMessage: null,
       );
@@ -1621,19 +1616,30 @@ class DocumentValidationService {
     }
 
     if (extractionTarget == 'baptismal_certificate') {
-      data['full_name'] = _extractBaptismalCertificateName(extractedText);
-      data['date_of_birth'] = _extractLabeledDate(extractedText, [
+      // Parish certificates commonly use a sentence-and-lines layout rather
+      // than explicit `Field: value` pairs.  Read that layout as a coherent
+      // record so a sponsor, parent, or priest cannot be mistaken for the
+      // person named in the certificate.
+      final certificate = _extractBaptismalCertificateFields(extractedText);
+      data.addAll(certificate);
+
+      data['full_name'] = certificate['full_name'] ??
+          _extractBaptismalCertificateName(extractedText);
+      data['date_of_birth'] = certificate['date_of_birth'] ??
+          _extractLabeledDate(extractedText, [
         'date of birth',
         'birth date',
         'born on',
         'petsa ng kapanganakan',
       ]);
-      data['place_of_birth'] = _extractLabeledValue(extractedText, [
+      data['place_of_birth'] = certificate['place_of_birth'] ??
+          _extractLabeledValue(extractedText, [
         'place of birth',
         'born in',
         'lugar ng kapanganakan',
       ]);
-      data['date_of_baptism'] = _extractLabeledDate(extractedText, [
+      data['date_of_baptism'] = certificate['date_of_baptism'] ??
+          _extractLabeledDate(extractedText, [
         'date of baptism',
         'baptism date',
         'was solemnly baptized on',
@@ -1643,7 +1649,8 @@ class DocumentValidationService {
         'petsa ng binyag',
         'kailan nabinyagan',
       ]);
-      data['place_of_baptism'] = _extractLabeledValue(extractedText, [
+      data['place_of_baptism'] = certificate['place_of_baptism'] ??
+          _extractLabeledValue(extractedText, [
         'place of baptism',
         'parish of baptism',
         'church of baptism',
@@ -1653,7 +1660,8 @@ class DocumentValidationService {
         'saan nabinyagan',
         'lugar ng binyag',
       ]);
-      data['parish_name'] = _extractParishName(extractedText);
+      data['parish_name'] = certificate['parish_name'] ??
+          _extractParishName(extractedText);
     }
 
     if (extractionTarget == 'confirmation_certificate') {
@@ -1882,12 +1890,165 @@ class DocumentValidationService {
     // solemnly baptized on ...". It has no explicit Name field, so parse the
     // person between the certificate phrase and the baptism/birth statement.
     final match = RegExp(
-      r'this\s+is\s+to\s+certify\s+that\s+(.{2,100}?)\s+(?:who\s+)?was\s+(?:solemnly\s+)?(?:baptized|baptised|born)\b',
+      r'(?:this\s+is\s+to\s+certify\s+)?that\s+(.{2,100}?)(?=\s+(?:child\s+of|born\s+in|(?:who\s+)?was\s+(?:solemnly\s+)?(?:baptized|baptised|born))\b)',
       caseSensitive: false,
       dotAll: true,
     ).firstMatch(text);
     if (match == null) return '';
     return _cleanOcrFieldValue(match.group(1)!).replaceAll('\n', ' ');
+  }
+
+  /// Extracts the semantic fields in the traditional Philippine parish
+  /// certificate layout.  This deliberately keys every value to the printed
+  /// label or sentence around it; it never selects an arbitrary capitalised
+  /// line as a name.
+  static Map<String, dynamic> _extractBaptismalCertificateFields(String text) {
+    final reading = _normaliseOcrText(text).replaceAll('\n', ' ');
+    final fields = <String, dynamic>{};
+
+    String valueBefore(String expression, String endExpression) {
+      final match = RegExp(
+        '$expression\\s+(.{2,140}?)(?=\\s+(?:$endExpression))',
+        caseSensitive: false,
+        dotAll: true,
+      ).firstMatch(reading);
+      return match == null ? '' : _cleanOcrFieldValue(match.group(1)!);
+    }
+
+    final childName = valueBefore(
+      r'(?:this\s+is\s+to\s+certify\s+)?that',
+      r'child\s+of|born\s+in|(?:who\s+)?was\s+(?:solemnly\s+)?bapti[sz]ed',
+    );
+    if (_isLikelyPersonName(childName)) fields['full_name'] = childName;
+
+    // `CHILD OF [father] OF [place] AND [mother] OF [place]` is a separate
+    // record section, so extract each parent only within that section.
+    final parents = RegExp(
+      r'child\s+of\s+(.{2,100}?)\s+of\s+.+?\s+(?:and|&|at)\s+(.{2,100}?)\s+of\s+',
+      caseSensitive: false,
+      dotAll: true,
+    ).firstMatch(reading);
+    if (parents != null) {
+      final father = _cleanOcrFieldValue(parents.group(1)!);
+      final mother = _cleanOcrFieldValue(parents.group(2)!);
+      if (_isLikelyPersonName(father)) fields['father_name'] = father;
+      if (_isLikelyPersonName(mother)) fields['mother_name'] = mother;
+      final parentNames = [father, mother]
+          .where(_isLikelyPersonName)
+          .join(', ');
+      if (parentNames.isNotEmpty) fields['parent_names'] = parentNames;
+    }
+
+    final bornIn = valueBefore(
+      r'born\s+in',
+      r'\d{1,2}\s+(?:day\s+of\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)',
+    );
+    if (_isPlausibleOcrFieldValue(bornIn)) fields['place_of_birth'] = bornIn;
+
+    final birthDate = _extractRiteCertificateDate(reading, beforeBaptism: true);
+    if (birthDate.isNotEmpty) fields['date_of_birth'] = birthDate;
+    final baptismDate = _extractRiteCertificateDate(reading, beforeBaptism: false);
+    if (baptismDate.isNotEmpty) fields['date_of_baptism'] = baptismDate;
+
+    final minister = valueBefore(
+      r'(?:by\s+the\s+reverend|officiating\s+(?:priest|minister)|minister\s+of\s+baptism)',
+      r'the\s+sponsors?\s+being|sponsors?\s*(?:being|:)|parish\s+priest|$'
+    );
+    if (_isLikelyPersonName(minister)) fields['minister_of_baptism'] = minister;
+
+    final sponsors = RegExp(
+      r'(?:the\s+)?sponsors?\s+(?:being)?\s*[:\-]?\s*(.{2,500}?)(?=\s+(?:parish\s+priest|certified\s+(?:true|correct)|$))',
+      caseSensitive: false,
+      dotAll: true,
+    ).firstMatch(reading);
+    if (sponsors != null) {
+      final sponsorText = _cleanOcrFieldValue(sponsors.group(1)!);
+      if (_isPlausibleOcrFieldValue(sponsorText)) {
+        fields['sponsors'] = sponsorText;
+      }
+    }
+    final sponsorNames = _extractTraditionalSponsorNames(text);
+    if (sponsorNames.isNotEmpty) fields['sponsor_names'] = sponsorNames;
+
+    final parish = _extractTraditionalBaptismParishName(text);
+    if (_isPlausibleOcrFieldValue(parish)) {
+      fields['parish_name'] = parish;
+      // Most traditional certificates identify the baptising parish only in
+      // the letterhead, so that same labelled institution is the safest
+      // available place-of-baptism value.
+      fields['place_of_baptism'] = parish;
+    }
+    return fields;
+  }
+
+  /// Sponsor lines normally follow the pattern `NAME OF ADDRESS`.  Read only
+  /// the text before `OF` on each line; addresses and the parish priest line
+  /// must not be offered as godparent names.
+  static List<String> _extractTraditionalSponsorNames(String text) {
+    final lines = _normaliseOcrText(text).split('\n');
+    var inSponsors = false;
+    final names = <String>[];
+    for (final line in lines) {
+      final normalized = line.trim();
+      if (RegExp(r'\b(?:the\s+)?sponsors?\b', caseSensitive: false)
+          .hasMatch(normalized)) {
+        inSponsors = true;
+        continue;
+      }
+      if (!inSponsors) continue;
+      if (RegExp(r'\b(?:parish\s+priest|certified\s+(?:true|correct))\b',
+              caseSensitive: false)
+          .hasMatch(normalized)) {
+        break;
+      }
+      final match = RegExp(r'^\s*(.{2,100}?)\s+of\s+', caseSensitive: false)
+          .firstMatch(normalized);
+      if (match == null) continue;
+      final name = _cleanOcrFieldValue(match.group(1)!);
+      if (_isLikelyPersonName(name) && !names.contains(name)) names.add(name);
+    }
+    return names;
+  }
+
+  /// Traditional certificates often put the baptising parish only in the
+  /// letterhead, before the certificate title.  Limit the capture to that
+  /// header so the title, certificate number, and body never become part of
+  /// the parish field.
+  static String _extractTraditionalBaptismParishName(String text) {
+    final header = _normaliseOcrText(text).replaceAll('\n', ' ');
+    final match = RegExp(
+      r"\b(parish(?:\s+and\s+diocesan\s+shrine)?\s+of\s+(?:the\s+)?[A-Za-z .,'’&-]{3,140}?)(?=\s+(?:\d{3,}\s+)?certificate\s+of\s+baptism\b)",
+      caseSensitive: false,
+    ).firstMatch(header);
+    if (match != null) return _cleanOcrFieldValue(match.group(1)!);
+    return _extractParishName(text);
+  }
+
+  static bool _isLikelyPersonName(String value) {
+    if (!_isPlausibleOcrFieldValue(value) || value.length > 100) return false;
+    final lower = value.toLowerCase();
+    return !RegExp(
+      r'\b(?:certificate|baptism|church|parish|diocese|born|sponsor|reverend|day\s+of)\b',
+    ).hasMatch(lower);
+  }
+
+  /// Handles the segmented date printed by many parish forms, for example
+  /// `31 DAY OF MAY 20 05` and `ON THE 23 DAY OF OCT, 20 05`.
+  static String _extractRiteCertificateDate(
+    String text, {
+    required bool beforeBaptism,
+  }) {
+    final expression = beforeBaptism
+        ? r'(\d{1,2})\s+(?:day\s+of\s+)?([a-z]{3,9})[,]?\s+(\d{2})\s*(\d{2})(?=\s+was\s+(?:solemnly\s+)?bapti[sz]ed)'
+        : r'(?:bapti[sz]ed\s+(?:on\s+)?(?:the\s+)?)?(\d{1,2})\s+(?:day\s+of\s+)?([a-z]{3,9})[,]?\s+(\d{2})\s*(\d{2})';
+    final matches = RegExp(expression, caseSensitive: false)
+        .allMatches(text)
+        .toList(growable: false);
+    if (matches.isEmpty) return '';
+    final match = beforeBaptism ? matches.first : matches.last;
+    return _normaliseDate(
+      '${match.group(1)} ${match.group(2)} ${match.group(3)}${match.group(4)}',
+    );
   }
 
   static String _extractLabeledDate(String text, List<String> labels) {

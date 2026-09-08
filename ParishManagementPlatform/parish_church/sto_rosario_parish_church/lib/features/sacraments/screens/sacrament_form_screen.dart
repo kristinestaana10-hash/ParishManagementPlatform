@@ -5094,6 +5094,36 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                 caseSensitive: false)
             .hasMatch(candidate);
 
+    bool canUseInField(String fieldKey, String candidate) {
+      final definition = _data.fieldDefinitions[fieldKey] ?? const {};
+      final type = (definition['type'] ?? '').toString().toLowerCase();
+      final options = definition['options'] is List
+          ? (definition['options'] as List)
+              .map((option) => option.toString().trim())
+              .where((option) => option.isNotEmpty)
+              .toList(growable: false)
+          : const <String>[];
+      if ((type == 'select' || type == 'dropdown') && options.isNotEmpty) {
+        return options.any(
+          (option) => option.toLowerCase() == candidate.toLowerCase(),
+        );
+      }
+      return type != 'time' && !fieldKey.toLowerCase().contains('time');
+    }
+
+    String valueForField(String fieldKey, String candidate) {
+      final definition = _data.fieldDefinitions[fieldKey] ?? const {};
+      final options = definition['options'] is List
+          ? (definition['options'] as List)
+              .map((option) => option.toString().trim())
+              .toList(growable: false)
+          : const <String>[];
+      return options.firstWhere(
+        (option) => option.toLowerCase() == candidate.toLowerCase(),
+        orElse: () => candidate,
+      );
+    }
+
     void apply(
       String extractedKey,
       bool Function(String normalized) matches, {
@@ -5110,8 +5140,10 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           : findField(matches);
       if (key == null) return;
       final controller = _controllers[key];
-      if (controller != null && controller.text.trim().isEmpty) {
-        proposed[key] = extracted;
+      if (controller != null &&
+          controller.text.trim().isEmpty &&
+          canUseInField(key, extracted)) {
+        proposed[key] = valueForField(key, extracted);
       }
     }
 
@@ -5170,8 +5202,67 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           mappedValue = extracted;
         }
 
-        if (mappedValue != null && mappedValue.isNotEmpty) {
-          proposed[entry.key] = mappedValue;
+        if (mappedValue != null &&
+            mappedValue.isNotEmpty &&
+            canUseInField(entry.key, mappedValue)) {
+          proposed[entry.key] = valueForField(entry.key, mappedValue);
+        }
+      }
+    }
+
+    void applySponsorNames() {
+      final rawNames = data['sponsor_names'];
+      if (rawNames is! Iterable) return;
+      final names = rawNames
+          .map((name) => name.toString().trim())
+          .where(isNameValue)
+          .toList(growable: false);
+      if (names.isEmpty) return;
+
+      // Sponsors are assigned in their certificate order, and only to fields
+      // explicitly identified as a godparent/Ninong/Ninang name.  This keeps
+      // a sponsor from being inserted into a parent or applicant field.
+      final sponsorFields = _controllers.entries
+          .where((entry) {
+            final field = entry.key.toLowerCase();
+            return entry.value.text.trim().isEmpty &&
+                (field.contains('godparent') ||
+                    field.contains('ninong') ||
+                    field.contains('ninang') ||
+                    field.contains('sponsor')) &&
+                (field.contains('name') || field.contains('pangalan'));
+          })
+          .map((entry) => entry.key)
+          .toList(growable: false);
+      for (var index = 0;
+          index < names.length && index < sponsorFields.length;
+          index++) {
+        proposed[sponsorFields[index]] = names[index];
+      }
+    }
+
+    void applyListedNames(
+      String extractedKey,
+      bool Function(String field) matches,
+    ) {
+      final rawNames = data[extractedKey];
+      final names = (rawNames is Iterable
+              ? rawNames
+              : rawNames is String
+              ? rawNames.split(RegExp(r'\s*(?:,|;|\band\b|&)\s*'))
+              : const <dynamic>[])
+          .map((name) => name.toString().trim())
+          .where(isNameValue)
+          .toList(growable: false);
+      if (names.isEmpty) return;
+      final fields = _controllers.entries
+          .where((entry) =>
+              entry.value.text.trim().isEmpty && matches(entry.key.toLowerCase()))
+          .map((entry) => entry.key)
+          .toList(growable: false);
+      for (var index = 0; index < names.length && index < fields.length; index++) {
+        if (canUseInField(fields[index], names[index])) {
+          proposed[fields[index]] = valueForField(fields[index], names[index]);
         }
       }
     }
@@ -5182,6 +5273,18 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     applyName('father_name', role: 'father');
     applyName('mother_name', role: 'mother');
     applyName('spouse_name', role: 'spouse');
+    applySponsorNames();
+    apply('parent_names',
+        (field) =>
+            (field.contains('parent') || field.contains('magulang')) &&
+            (field.contains('name') || field.contains('pangalan')),
+        isValid: isTextValue);
+    applyListedNames(
+      'witness_names',
+      (field) =>
+          (field.contains('witness') || field.contains('saksi')) &&
+          (field.contains('name') || field.contains('pangalan')),
+    );
     apply('date_of_birth',
         (field) =>
             (field.contains('date') || field.contains('petsa')) &&
@@ -5197,6 +5300,8 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         isValid: isTextValue);
     apply('date_of_baptism',
         (field) =>
+            !field.contains('registration') &&
+            !field.contains('schedule') &&
             (field.contains('date') || field.contains('petsa') || field.contains('kailan')) &&
             (field.contains('baptism') || field.contains('binyag') || field.contains('nabinyag')),
         isValid: isDateValue);
@@ -5241,28 +5346,15 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             (field.contains('burial') || field.contains('libing')),
         isValid: isTextValue);
     apply('parish_name', (field) =>
-        field.contains('parish') || field.contains('parokya'),
+        field.contains('parish') || field.contains('parokya') || field.contains('church'),
         isValid: isTextValue);
+    apply('minister_of_baptism',
+        (field) =>
+            (field.contains('minister') || field.contains('reverend') || field.contains('priest')) &&
+            (field.contains('baptism') || field.contains('binyag') || field.contains('nagbinyag')),
+        isValid: isNameValue);
 
     if (!mounted) return false;
-
-    final technicalKeys = <String>{
-      'extraction_target',
-      'document_type',
-      'validation_method',
-      'matched_keyword',
-      'ocr_text_found',
-    };
-    final detected = <String, String>{};
-    for (final entry in data.entries) {
-      if (technicalKeys.contains(entry.key) || entry.value == null) continue;
-      final rawValue = entry.value;
-      if (rawValue is! String && rawValue is! Iterable) continue;
-      final text = rawValue is Iterable
-          ? rawValue.whereType<Object>().join(', ').trim()
-          : rawValue.toString().trim();
-      if (text.isNotEmpty && text != 'null') detected[entry.key] = text;
-    }
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -5283,25 +5375,6 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                     ? 'Suriin ang lahat ng detalyeng nabasa mula sa ${_data.requirements[requirementIndex]}. Walang mababago sa form hangga\'t hindi mo ito kinukumpirma.'
                     : 'Review all details read from ${_data.requirements[requirementIndex]}. Nothing is added to the form until you confirm.',
               ),
-              const SizedBox(height: 12),
-              Text(
-                widget.isTagalog ? 'Mga na-detect na detalye' : 'Detected details',
-                style: const TextStyle(fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 6),
-              if (detected.isEmpty)
-                Text(
-                  widget.isTagalog
-                      ? 'Walang malinaw na detalyeng nakuha mula sa dokumento.'
-                      : 'No clear details were extracted from this document.',
-                )
-              else
-                ...detected.entries.map(
-                  (entry) => Padding(
-                    padding: const EdgeInsets.only(bottom: 6),
-                    child: Text('${_formatOcrKey(entry.key)}: ${entry.value}'),
-                  ),
-                ),
               const SizedBox(height: 12),
               Text(
                 widget.isTagalog
