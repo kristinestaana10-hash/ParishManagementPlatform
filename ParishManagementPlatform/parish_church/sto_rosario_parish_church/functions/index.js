@@ -938,7 +938,7 @@ async function sendInvoiceEmail({
     text: [
       `Hello ${donorName},`,
       '',
-      `Thank you for initiating a ${invoiceType.toLowerCase()}.`,
+      `Your ${invoiceType.toLowerCase()} invoice has been created. Payment is pending until Xendit confirms it.`,
       `Amount: ${formattedAmount}`,
       `Reference ID: ${referenceId}`,
       `Payment Link: ${invoiceUrl}`,
@@ -952,7 +952,7 @@ async function sendInvoiceEmail({
           </div>
           <div style="padding:24px;">
             <p style="margin:0 0 12px;">Hello <strong>${escapeHtml(donorName)}</strong>,</p>
-            <p style="margin:0 0 18px;line-height:1.6;">Thank you for your ${escapeHtml(invoiceType.toLowerCase())}. Here is the information for your record.</p>
+            <p style="margin:0 0 18px;line-height:1.6;">Your ${escapeHtml(invoiceType.toLowerCase())} invoice has been created. Payment is pending until Xendit confirms it.</p>
             <div style="height:4px;background:${EMAIL_BRAND.gold};margin:0 0 18px;"></div>
             <div style="background:${EMAIL_BRAND.bg};border:1px solid ${EMAIL_BRAND.border};border-radius:8px;padding:16px;line-height:1.8;">
               <div><span style="color:${EMAIL_BRAND.muted};">Amount:</span> <strong>${escapeHtml(formattedAmount)}</strong></div>
@@ -1055,11 +1055,17 @@ async function createXenditInvoice({
   payerEmail,
   description,
   customerName,
+  paymentType,
 }) {
   const rawEmail = String(payerEmail || '').trim();
   const fallbackEmail = 'anonymous@sto-rosario-parish.local';
   const normalizedEmail = rawEmail.length > 0 ? rawEmail : fallbackEmail;
   const normalizedCustomerName = String(customerName || '').trim() || 'Donor';
+  // Send a successful Xendit checkout straight back to the installed mobile
+  // app. The hosted page is deliberately not part of the success flow.
+  const successReturnUrl = new URL('storosarioparish://payment-return');
+  successReturnUrl.searchParams.set('payment_id', externalId);
+  successReturnUrl.searchParams.set('payment_type', paymentType || 'donation');
 
   const requestBody = {
     external_id: externalId,
@@ -1067,6 +1073,9 @@ async function createXenditInvoice({
     payer_email: normalizedEmail,
     description,
     currency: 'PHP',
+    // Xendit redirects to the app only after a successful checkout. The app
+    // still asks this server to verify the invoice before showing success.
+    success_redirect_url: successReturnUrl.toString(),
     customer: {
       given_names: normalizedCustomerName,
       email: normalizedEmail,
@@ -1109,6 +1118,13 @@ async function createXenditInvoice({
   }
 
   return data || {};
+}
+
+function parsePhpAmount(value) {
+  if (typeof value === 'number') return value;
+  const normalized = String(value ?? '').replace(/[^0-9.]/g, '');
+  if (!normalized || (normalized.match(/\./g) || []).length > 1) return NaN;
+  return Number(normalized);
 }
 
 async function sendBookingConfirmationEmail({
@@ -1467,7 +1483,7 @@ exports.createXenditDonationInvoice = onCall(
       const donationType = (normalizedData.donationType || 'monetary').toString();
       const isAnonymous = Boolean(normalizedData.isAnonymous);
 
-      const amountNumber = Number(normalizedData.amount);
+      const amountNumber = parsePhpAmount(normalizedData.amount);
       if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
         throw new HttpsError('invalid-argument', 'Amount must be a number greater than zero.');
       }
@@ -1490,10 +1506,12 @@ exports.createXenditDonationInvoice = onCall(
         donorName = (normalizedData.name || request.auth?.token?.name || 'Anonymous').toString().trim() || 'Anonymous';
       }
       
-      const donorEmail = (normalizedData.email || '').toString().trim();
-      // Email is optional for anonymous, required for non-anonymous
-      if (!isAnonymous && !isValidEmail(donorEmail)) {
-        throw new HttpsError('invalid-argument', 'A valid email address is required for non-anonymous donations.');
+      // Email is optional. Xendit receives a safe fallback email when none is
+      // supplied; validate only an email the donor actually provided.
+      const donorEmail = (normalizedData.email ||
+        (!isAnonymous && (normalizedData.userEmail || request.auth?.token?.email)) || '').toString().trim();
+      if (donorEmail && !isValidEmail(donorEmail)) {
+        throw new HttpsError('invalid-argument', 'Please provide a valid email address when entering an email.');
       }
 
       const userName = request.auth?.token?.name || donorName;
@@ -1510,6 +1528,7 @@ exports.createXenditDonationInvoice = onCall(
         payerEmail: donorEmail,
         description: 'Donation - Sto. Rosario Parish Church',
         customerName: donorName,
+        paymentType: (normalizedData.paymentReturnType || 'donation').toString(),
       });
 
       const invoiceId = String(invoice?.id || '').trim();
@@ -1600,7 +1619,7 @@ exports.createXenditMassOfferingInvoice = onCall(
       }
 
       const isAnonymous = Boolean(normalizedData.isAnonymous);
-      const amountNumber = Number(normalizedData.amount);
+      const amountNumber = parsePhpAmount(normalizedData.amount);
       if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
         throw new HttpsError('invalid-argument', 'Amount must be a number greater than zero.');
       }
@@ -1625,9 +1644,12 @@ exports.createXenditMassOfferingInvoice = onCall(
         donorName = (normalizedData.name || request.auth?.token?.name || 'Anonymous').toString().trim() || 'Anonymous';
       }
 
-      const donorEmail = (normalizedData.email || '').toString().trim();
-      if (!isAnonymous && !isValidEmail(donorEmail)) {
-        throw new HttpsError('invalid-argument', 'A valid email address is required for non-anonymous mass offerings.');
+      // A mass offering can be paid without a receipt email. Validate only a
+      // supplied email instead of rejecting the amount submission.
+      const donorEmail = (normalizedData.email ||
+        (!isAnonymous && (normalizedData.userEmail || request.auth?.token?.email)) || '').toString().trim();
+      if (donorEmail && !isValidEmail(donorEmail)) {
+        throw new HttpsError('invalid-argument', 'Please provide a valid email address when entering an email.');
       }
 
       const userName = request.auth?.token?.name || donorName;
@@ -1643,6 +1665,7 @@ exports.createXenditMassOfferingInvoice = onCall(
         payerEmail: donorEmail,
         description: 'Mass Offering - Sto. Rosario Parish Church',
         customerName: donorName,
+        paymentType: 'offering',
       });
 
       const invoiceId = String(invoice?.id || '').trim();
@@ -1706,6 +1729,71 @@ exports.createXenditMassOfferingInvoice = onCall(
       });
       throw new HttpsError('internal', err?.message ? String(err.message) : 'Unknown internal error');
     }
+  }
+);
+
+// A return URL is only navigation. This callable verifies the invoice on the
+// server before the app can present a completed-payment message.
+exports.getVerifiedXenditPaymentStatus = onCall(
+  {
+    region: 'asia-southeast1',
+    secrets: [XENDIT_SECRET_KEY],
+  },
+  async (request) => {
+    const paymentId = String(request.data?.paymentId || '').trim();
+    const paymentType = String(request.data?.paymentType || 'donation').trim();
+    if (!paymentId || !/^[A-Za-z0-9_-]+$/.test(paymentId)) {
+      throw new HttpsError('invalid-argument', 'A valid payment reference is required.');
+    }
+    if (!['donation', 'donationDrive', 'offering'].includes(paymentType)) {
+      throw new HttpsError('invalid-argument', 'Unsupported payment type.');
+    }
+
+    const collectionName = paymentType === 'offering'
+      ? 'mass_offerings'
+      : 'donations';
+    const paymentRef = admin.firestore().collection(collectionName).doc(paymentId);
+    const paymentSnap = await paymentRef.get();
+    if (!paymentSnap.exists) {
+      throw new HttpsError('not-found', 'Payment reference not found.');
+    }
+
+    const payment = paymentSnap.data() || {};
+    const invoiceId = String(payment?.xendit?.invoiceId || '').trim();
+    if (!invoiceId) {
+      throw new HttpsError('failed-precondition', 'Payment invoice is unavailable.');
+    }
+
+    const response = await fetch(`https://api.xendit.co/v2/invoices/${encodeURIComponent(invoiceId)}`, {
+      headers: { Authorization: xenditAuthHeader() },
+    });
+    if (!response.ok) {
+      console.error('Xendit invoice verification failed', { paymentId, invoiceId, status: response.status });
+      throw new HttpsError('unavailable', 'Unable to verify the payment status. Please try again.');
+    }
+    const invoice = await response.json();
+    const xenditStatus = String(invoice?.status || '').toUpperCase();
+    let verifiedStatus = String(payment.status || 'pending').toLowerCase();
+    const update = {
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      xendit: {
+        ...(payment.xendit || {}),
+        status: xenditStatus.toLowerCase(),
+      },
+    };
+    if (xenditStatus === 'PAID' || xenditStatus === 'SETTLED') {
+      verifiedStatus = 'paid';
+      update.status = 'paid';
+      update.xendit.paidAt = admin.firestore.FieldValue.serverTimestamp();
+    } else if (xenditStatus === 'EXPIRED' || xenditStatus === 'FAILED') {
+      verifiedStatus = 'failed';
+      update.status = 'failed';
+    } else {
+      verifiedStatus = 'pending';
+      update.status = 'pending';
+    }
+    await paymentRef.set(update, { merge: true });
+    return { status: verifiedStatus };
   }
 );
 
@@ -2632,6 +2720,84 @@ function detectAssistantIntent(text) {
   return Array.from(intents);
 }
 
+function parishServiceListAnswer(message, language) {
+  const lower = String(message || '').toLowerCase();
+  const asksForList = /(what|which|list|ano|alin|anu-ano|anong).{0,50}(sacrament|service|serbisyo|sakramento)|(sacrament|service|serbisyo|sakramento).{0,50}(offer|available|book|list|ino-offer|maaari|pwede|puwede)/i.test(lower);
+  if (!asksForList) return '';
+
+  const services = language === 'tagalog'
+    ? [
+      '• Binyag',
+      '• Kumpil',
+      '• Kasal',
+      '• Misa para sa Yumao',
+      '• Basbas ng Bahay',
+      '• Pagpapahid sa May Sakit',
+      '• Intensyon ng Misa',
+      '• Unang Komunyon',
+    ].join('\n')
+    : [
+      '• Baptism',
+      '• Confirmation',
+      '• Wedding',
+      '• Funeral Mass',
+      '• House Blessing',
+      '• Anointing of the Sick',
+      '• Mass Intention',
+      '• First Communion',
+    ].join('\n');
+  return language === 'tagalog'
+    ? `Narito ang mga serbisyong maaaring i-book sa Sto. Rosario Parish app:\n${services}\n\nPara magpatuloy, pumili ng serbisyo sa Home screen upang makita ang mga detalye at booking form.`
+    : `Here are the services available to book through the Sto. Rosario Parish app:\n${services}\n\nTo get started, select a service on the Home screen to view its details and booking form.`;
+}
+
+function formatAssistantReply(reply) {
+  const lines = String(reply || '').split(/\r?\n/);
+  const formatted = [];
+  const cellsFor = (line) => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
+
+  for (let index = 0; index < lines.length;) {
+    if (!lines[index].includes('|')) {
+      formatted.push(lines[index]);
+      index += 1;
+      continue;
+    }
+
+    const tableLines = [];
+    while (index < lines.length && lines[index].includes('|')) {
+      tableLines.push(lines[index]);
+      index += 1;
+    }
+    const separatorIndex = tableLines.findIndex((line) => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line));
+    if (separatorIndex <= 0) {
+      formatted.push(...tableLines.map((line) => line.replace(/^\s*\|\s*/, '').replace(/\s*\|\s*$/, '').replace(/\s*\|\s*/g, ' — ')));
+      continue;
+    }
+
+    const headers = cellsFor(tableLines[separatorIndex - 1]);
+    const dataRows = tableLines.slice(separatorIndex + 1).filter((line) => !/^\s*\|?\s*:?-{3,}/.test(line));
+    for (const rowLine of dataRows) {
+      const values = cellsFor(rowLine);
+      if (!values.some(Boolean)) continue;
+      const nameIndex = headers.findIndex((header) => /^(name|service|sacrament|title)$/i.test(header));
+      const name = values[nameIndex] || values.find(Boolean) || '';
+      const details = headers.flatMap((header, cellIndex) => {
+        const value = values[cellIndex];
+        if (!value || cellIndex === nameIndex || /^(type|category)$/i.test(header)) return [];
+        return [`${header}: ${value}`];
+      });
+      formatted.push(`• ${name}${details.length ? ` — ${details.join('; ')}` : ''}`);
+    }
+    if (!dataRows.length) formatted.push(...tableLines.slice(0, separatorIndex - 1));
+  }
+
+  return formatted.join('\n')
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 const SERVICE_FACT_COLLECTIONS = [
   // This is the source used by the booking screens for the currently
   // available sacrament forms. Keep it first so the assistant reads the
@@ -2905,8 +3071,11 @@ function directServiceFactAnswer(language, intents, serviceFacts) {
         : 'No fee field is recorded in the database for that service.');
     } else {
       feeRows.forEach((row) => {
-        const values = row.fees.map((fee) => `${fee.field}: ${formatFactValue(fee.value)}`).join(', ');
-        lines.push(`${row.service}: ${values}`);
+        const values = row.fees.map((fee) => {
+          const label = fee.field.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[._]/g, ' ');
+          return `${label}: ${formatFactValue(fee.value)}`;
+        }).join('; ');
+        lines.push(`• ${row.service}: ${values}`);
       });
     }
   }
@@ -2920,14 +3089,14 @@ function directServiceFactAnswer(language, intents, serviceFacts) {
     } else {
       requirementRows.forEach((row) => {
         const values = row.requirements.map((item) => typeof item === 'string' ? item : JSON.stringify(item)).join('; ');
-        lines.push(`${row.service}: ${values}`);
+        lines.push(`• ${row.service}: ${values}`);
       });
     }
   }
 
   return language === 'tagalog'
-    ? `Batay sa kasalukuyang database record: ${lines.join(' ')}`
-    : `Based on the current database record: ${lines.join(' ')}`;
+    ? `Narito ang impormasyong naka-record para sa serbisyong tinanong mo:\n${lines.join('\n')}`
+    : `Here is the information recorded for the service you asked about:\n${lines.join('\n')}`;
 }
 
 function publicBookingSummary(doc) {
@@ -3194,6 +3363,16 @@ exports.askParishAssistant = onCall(
 
     const db = admin.firestore();
 
+    const serviceListAnswer = parishServiceListAnswer(message, language);
+    if (serviceListAnswer) {
+      return {
+        reply: serviceListAnswer,
+        intents,
+        usedRealtimeData: false,
+        answeredFromDatabase: false,
+      };
+    }
+
     const publicData = await getPublicParishSnapshot(db, intents, message);
     const userData = await getUserScopedSnapshot(db, request.auth?.uid || '', intents);
     if (!hasGroundedAssistantData(publicData, userData)) {
@@ -3223,7 +3402,7 @@ Authenticated user: ${request.auth?.uid ? 'yes' : 'no'}
 Whitelisted real-time database context:
 ${JSON.stringify({ publicData, userData }, null, 2)}
 
-Answer naturally and concisely. Cite only facts found in the supplied database context. Never answer from general knowledge or from the conversation history. If the context does not contain the requested fact, use the prescribed unavailable-information response. Do not mention implementation details, APIs, JSON, Firestore, or database internals unless the user asks technical support staff questions.`;
+Answer in a formal, courteous, easy-to-understand way for a first-time parishioner. Start with a direct answer, then explain the relevant next step in plain language when useful. Use short paragraphs and simple bullet points for lists. Do not use tables, pipe characters, or dense blocks of text. Explain app navigation in familiar terms such as “Home screen.” Avoid unexplained technical or church-specific terms. Cite only facts found in the supplied database context. Never answer from general knowledge or from the conversation history. If the context does not contain the requested fact, use the prescribed unavailable-information response. Do not mention implementation details, APIs, JSON, Firestore, or database internals unless the user asks technical support staff questions.`;
 
     const apiKey = (GROQ_API_KEY.value() || process.env.GROQ_API_KEY || '').trim();
     if (!apiKey) {
@@ -3265,7 +3444,7 @@ Answer naturally and concisely. Cite only facts found in the supplied database c
       throw new HttpsError('internal', 'The AI service returned an invalid response.');
     }
 
-    const reply = String(body?.choices?.[0]?.message?.content || '').trim();
+    const reply = formatAssistantReply(body?.choices?.[0]?.message?.content || '');
     if (!reply) {
       throw new HttpsError('internal', 'The AI service returned an empty response.');
     }

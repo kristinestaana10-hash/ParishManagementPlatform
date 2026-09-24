@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Return to Sto. Rosario Parish</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #eff6ff; color: #172554; font-family: Arial, sans-serif; }
+    main { width: min(440px, calc(100% - 48px)); box-sizing: border-box; padding: 32px; text-align: center; background: #fff; border: 1px solid #bfdbfe; border-radius: 18px; box-shadow: 0 12px 28px rgba(30, 64, 175, .12); }
+    h1 { margin: 0 0 12px; font-size: 24px; }
+    p { margin: 0 0 24px; line-height: 1.5; color: #475569; }
+    button { display: block; width: 100%; border: 0; padding: 14px 18px; color: #fff; font: inherit; font-weight: 700; cursor: pointer; background: #1e40af; border-radius: 10px; }
+    button:active { background: #1e3a8a; }
+    small { display: block; margin-top: 18px; color: #64748b; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Return to Sto. Rosario Parish</h1>
+    <p>Return to the app to securely check your payment status.</p>
+    <button id="return-button" type="button">Go Back to App</button>
+    <small>Your donation or offering is confirmed only after the parish system verifies Xendit’s payment status.</small>
+  </main>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const paymentId = params.get('payment_id') || '';
+    const paymentType = params.get('payment_type') || '';
+    const appUrl = new URL('storosarioparish://payment-return');
+    if (paymentId) appUrl.searchParams.set('payment_id', paymentId);
+    if (paymentType) appUrl.searchParams.set('payment_type', paymentType);
+    const returnButton = document.getElementById('return-button');
+    returnButton.addEventListener('click', () => {
+      // Xendit's embedded Android browser can ignore a custom-scheme anchor.
+      // An explicit intent navigation is user initiated and opens the app's
+      // registered payment-return activity; iOS and other browsers use the
+      // normal custom-scheme navigation.
+      if (/Android/i.test(navigator.userAgent)) {
+        const intentUrl = `intent://payment-return${appUrl.search}#Intent;scheme=storosarioparish;package=ParishManagement.System;end`;
+        window.location.assign(intentUrl);
+        return;
+      }
+      window.location.assign(appUrl.toString());
+    });
+  </script>
+</body>
+</html>

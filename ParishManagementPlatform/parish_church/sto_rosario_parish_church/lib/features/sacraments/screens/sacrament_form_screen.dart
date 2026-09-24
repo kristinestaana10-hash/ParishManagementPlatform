@@ -2621,7 +2621,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             labelText: label,
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
           ),
-          value: selectedValue,
+          initialValue: selectedValue,
           hint: Text(
             allowedValues.isEmpty
                 ? (selectedDate.isEmpty

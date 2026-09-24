@@ -311,7 +311,7 @@ class _AIChatScreenState extends State<AIChatScreen> {
 
   List<String> _getSuggestedPrompts() {
     return [
-      'What are the sacraments?',
+      'What sacraments and services can I book?',
       'How to book baptism?',
       'When is mass?',
       'Where is the church?',

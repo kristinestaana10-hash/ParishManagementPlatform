@@ -1064,6 +1064,7 @@ class FirebaseService {
     String description = '',
     String message = '',
     String offeringLocation = '',
+    String paymentReturnType = 'donation',
   }) async {
     final callable = functions.httpsCallable('createXenditDonationInvoice');
     final result = await callable.call(<String, dynamic>{
@@ -1079,6 +1080,7 @@ class FirebaseService {
       'description': description,
       'message': message,
       'offeringLocation': offeringLocation,
+      'paymentReturnType': paymentReturnType,
     });
     final data = result.data;
     if (data is Map) {
@@ -1308,6 +1310,21 @@ class FirebaseService {
       }
     }
     return availableKeys;
+  }
+
+  /// The redirect from Xendit is navigation only.  This asks the server to
+  /// retrieve the invoice from Xendit before the app acknowledges a payment.
+  Future<String> getVerifiedXenditPaymentStatus({
+    required String paymentId,
+    required String paymentType,
+  }) async {
+    final callable = functions.httpsCallable('getVerifiedXenditPaymentStatus');
+    final result = await callable.call(<String, dynamic>{
+      'paymentId': paymentId,
+      'paymentType': paymentType,
+    });
+    final data = result.data;
+    return data is Map ? (data['status'] ?? '').toString().toLowerCase() : '';
   }
 
   /// Loads the editable requirements for a booking form.

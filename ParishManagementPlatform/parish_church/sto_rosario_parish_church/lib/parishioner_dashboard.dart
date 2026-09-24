@@ -100,7 +100,7 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
   int _bookingsCount = 0;
   int _notificationCount = 0;
   bool _isLanguageTagalog = false;
-  List<Map<String, dynamic>> _notifications = [];
+  final List<Map<String, dynamic>> _notifications = [];
 
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>?
   _bookingsSubscription;

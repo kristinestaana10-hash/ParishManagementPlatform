@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -47,6 +49,9 @@ class _DonationFeatureState extends State<DonationFeature>
   DonationType _selectedType = DonationType.monetary;
   bool _isAnonymous = false;
   bool _isLoading = false;
+  bool _hasPendingXenditPayment = false;
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
+      _paymentStatusSubscription;
   late TabController _tabController;
 
   final _formKey = GlobalKey<FormState>();
@@ -122,6 +127,7 @@ class _DonationFeatureState extends State<DonationFeature>
 
   @override
   void dispose() {
+    _paymentStatusSubscription?.cancel();
     _tabController.dispose();
     _amountController.dispose();
     _nameController.dispose();
@@ -151,6 +157,70 @@ class _DonationFeatureState extends State<DonationFeature>
   bool _isValidPhilippinePhone(String rawPhone) {
     final normalized = _normalizePhilippinePhone(rawPhone);
     return RegExp(r'^\+639\d{9}$').hasMatch(normalized);
+  }
+
+  double? _parsePhpAmount(String value) {
+    // Accept display-friendly entries such as "₱1,000" and "1,000.50".
+    final normalized = value.replaceAll(RegExp(r'[^0-9.]'), '');
+    if (normalized.isEmpty || RegExp(r'\..*\.').hasMatch(normalized)) {
+      return null;
+    }
+    return double.tryParse(normalized);
+  }
+
+  void _watchVerifiedPayment({
+    required String collection,
+    required String documentId,
+  }) {
+    _paymentStatusSubscription?.cancel();
+    _paymentStatusSubscription = FirebaseFirestore.instance
+        .collection(collection)
+        .doc(documentId)
+        .snapshots()
+        .listen((snapshot) {
+          final status = (snapshot.data()?['status'] ?? '')
+              .toString()
+              .toLowerCase();
+          if (status == 'paid') {
+            _paymentStatusSubscription?.cancel();
+            _paymentStatusSubscription = null;
+            if (!mounted) return;
+            _clearDonationForm();
+            setState(() => _hasPendingXenditPayment = false);
+            // The return deep link displays the acknowledgement after the
+            // server has independently verified Xendit. Do not display a
+            // second success message merely because this listener updated.
+          } else if (status == 'failed' || status == 'expired') {
+            _paymentStatusSubscription?.cancel();
+            _paymentStatusSubscription = null;
+            if (!mounted) return;
+            setState(() => _hasPendingXenditPayment = false);
+            _showModalNotificationGlobal(
+              context,
+              t(
+                'Hindi nakumpleto ang bayad. Nananatiling hindi bayad ang transaksyon.',
+                'The payment was not completed. This transaction was not marked as paid.',
+              ),
+              bgColor: Colors.red,
+            );
+          }
+        });
+  }
+
+  void _clearDonationForm() {
+    _formKey.currentState?.reset();
+    _amountController.clear();
+    _nameController.clear();
+    _emailController.clear();
+    _phoneController.clear();
+    _itemsController.clear();
+    _descriptionController.clear();
+    _messageController.clear();
+    setState(() {
+      _selectedType = DonationType.monetary;
+      _isAnonymous = false;
+      _selectedOfferingLocation = 'Sto. Rosario Parish';
+    });
   }
 
   Future<void> _submitDonation() async {
@@ -186,9 +256,19 @@ class _DonationFeatureState extends State<DonationFeature>
         userEmail = 'anonymous@example.com';
       } else {
         // Use Firebase Auth data if available, otherwise use form data
-        userName =
-            currentUser?.displayName?.trim() ?? _nameController.text.trim();
-        userEmail = currentUser?.email?.trim() ?? _emailController.text.trim();
+        final authenticatedName = currentUser?.displayName?.trim() ?? '';
+        final authenticatedEmail = currentUser?.email?.trim() ?? '';
+        userName = authenticatedName.isNotEmpty
+            ? authenticatedName
+            : _nameController.text.trim();
+        userEmail = authenticatedEmail.isNotEmpty
+            ? authenticatedEmail
+            : _emailController.text.trim();
+        // Logged-in accounts may not have a display name yet; that must not
+        // prevent an otherwise valid payment from being created.
+        if (userName.isEmpty && currentUser != null) {
+          userName = 'Donor';
+        }
       }
 
       // Frontend validation (skip for anonymous donations)
@@ -196,12 +276,9 @@ class _DonationFeatureState extends State<DonationFeature>
         if (userName.isEmpty) {
           throw Exception('User name is required');
         }
-        if (userEmail.isEmpty) {
-          throw Exception('User email is required');
-        }
-
-        // Basic email validation for non-anonymous
-        if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(userEmail)) {
+        // A receipt email is optional. Validate it only when one was supplied.
+        if (userEmail.isNotEmpty &&
+            !RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(userEmail)) {
           throw Exception('Please provide a valid email address');
         }
       }
@@ -209,11 +286,7 @@ class _DonationFeatureState extends State<DonationFeature>
       if (_selectedType == DonationType.monetary ||
           _selectedType == DonationType.massOffering) {
         // Monetary donations and mass offerings require amount > 0
-        final amountValue =
-            double.tryParse(
-              _amountController.text.trim().replaceAll(',', ''),
-            ) ??
-            0.0;
+        final amountValue = _parsePhpAmount(_amountController.text) ?? 0.0;
 
         if (amountValue <= 0) {
           throw Exception(
@@ -274,12 +347,26 @@ class _DonationFeatureState extends State<DonationFeature>
           throw Exception('Unable to open payment page');
         }
 
+        final paymentId = (result['donationId'] ?? '').toString();
+        if (paymentId.isEmpty) {
+          throw Exception('Missing payment reference');
+        }
+        if (mounted) {
+          setState(() => _hasPendingXenditPayment = true);
+          _watchVerifiedPayment(
+            collection: _selectedType == DonationType.massOffering
+                ? 'mass_offerings'
+                : 'donations',
+            documentId: paymentId,
+          );
+        }
+
         if (mounted) {
           _showModalNotificationGlobal(
             context,
             t(
               'Bubukas ang payment page. Kapag tapos na, hihintayin ng system ang kumpirmasyon ng bayad. Salamat!',
-              'Opening the payment page. After you complete payment, the system will confirm it. Thank you!',
+              'Payment is pending. After Xendit verifies it, the system will confirm your donation.',
             ),
             bgColor: ParishColors.primaryBlue,
           );
@@ -345,26 +432,17 @@ class _DonationFeatureState extends State<DonationFeature>
         await FirebaseService.instance.submitDonation(donationData);
       }
 
-      if (mounted) {
+      // Xendit payments remain pending until their webhook-confirmed status is
+      // received above. Non-payment commitments can be acknowledged now.
+      if (mounted &&
+          _selectedType != DonationType.monetary &&
+          _selectedType != DonationType.massOffering) {
         _showModalNotificationGlobal(
           context,
           t('Salamat sa inyong donasyon!', 'Thank you for your giving!'),
           bgColor: ParishColors.greenSuccess,
         );
-        // Clear form
-        _formKey.currentState!.reset();
-        _amountController.clear();
-        _nameController.clear();
-        _emailController.clear();
-        _phoneController.clear();
-        _itemsController.clear();
-        _descriptionController.clear();
-        _messageController.clear();
-        setState(() {
-          _selectedType = DonationType.monetary;
-          _isAnonymous = false;
-          _selectedOfferingLocation = 'Sto. Rosario Parish';
-        });
+        _clearDonationForm();
       }
     } catch (e) {
       if (mounted) {
@@ -549,7 +627,9 @@ class _DonationFeatureState extends State<DonationFeature>
                           width: double.infinity,
                           height: 56,
                           child: ElevatedButton(
-                            onPressed: _isLoading ? null : _submitDonation,
+                            onPressed: _isLoading || _hasPendingXenditPayment
+                                ? null
+                                : _submitDonation,
                             style: ElevatedButton.styleFrom(
                               backgroundColor: ParishColors.primaryGold,
                               foregroundColor: ParishColors.primaryBlue,
@@ -1287,8 +1367,11 @@ class _DonationFeatureState extends State<DonationFeature>
             controller: _amountController,
             labelText: t('Pera (PHP)', 'Amount (PHP)'),
             hintText: '100.00',
-            keyboardType: TextInputType.number,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
             prefixIcon: Icons.attach_money,
+            inputFormatters: [
+              FilteringTextInputFormatter.allow(RegExp(r'[0-9,.₱\s]')),
+            ],
             validator: (value) {
               // Only validate amount for monetary donations and mass offerings
               if (_selectedType == DonationType.monetary ||
@@ -1297,7 +1380,7 @@ class _DonationFeatureState extends State<DonationFeature>
                   return t('Ipasok ang halaga', 'Please enter amount');
                 }
 
-                final amount = double.tryParse(value.replaceAll(',', ''));
+                final amount = _parsePhpAmount(value);
                 if (amount == null || amount <= 0) {
                   return t(
                     'Ipasok ang wastong halaga',
@@ -1584,15 +1667,13 @@ class _DonationFeatureState extends State<DonationFeature>
           const SizedBox(height: 12),
           _buildTextField(
             controller: _emailController,
-            labelText: t('Email', 'Email Address'),
+            labelText: t('Email (Opsyonal)', 'Email Address (Optional)'),
             keyboardType: TextInputType.emailAddress,
             prefixIcon: Icons.email,
             validator: (value) {
               final trimmed = (value ?? '').trim();
-              if (trimmed.isEmpty) {
-                return t('Ipasok ang email', 'Please enter email');
-              }
-              if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(trimmed)) {
+              if (trimmed.isNotEmpty &&
+                  !RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(trimmed)) {
                 return t(
                   'Ipasok ang wastong email',
                   'Please enter a valid email',

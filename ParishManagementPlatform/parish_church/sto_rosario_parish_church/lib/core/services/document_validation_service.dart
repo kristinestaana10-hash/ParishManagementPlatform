@@ -781,7 +781,6 @@ class DocumentValidationService {
   ) {
     print('DEBUG: Validating baptism certificate template');
 
-    final upperText = extractedText.toUpperCase();
     final lowerText = extractedText.toLowerCase();
 
     // EXACT TEMPLATE PHRASES from user's format
@@ -796,10 +795,12 @@ class DocumentValidationService {
       'THE SPONSORS BEING',
     ];
 
-    // Check for exact template phrases
+    // Check for template phrases.  OCR commonly introduces a line break,
+    // punctuation, or a single character error into a perfectly readable
+    // heading, so use a layout-insensitive reading for certificate evidence.
     int templatePhraseCount = 0;
     for (final phrase in templatePhrases) {
-      if (upperText.contains(phrase.toUpperCase())) {
+      if (_containsFlexibleOcrPhrase(extractedText, phrase)) {
         templatePhraseCount++;
       }
     }
@@ -816,7 +817,7 @@ class DocumentValidationService {
     String foundIndicator = '';
 
     for (final indicator in baptismIndicators) {
-      if (upperText.contains(indicator)) {
+      if (_containsFlexibleOcrPhrase(extractedText, indicator)) {
         hasBaptismIndicator = true;
         foundIndicator = indicator;
         break;
@@ -835,7 +836,7 @@ class DocumentValidationService {
 
     bool hasChurchIndicator = false;
     for (final indicator in churchIndicators) {
-      if (upperText.contains(indicator)) {
+      if (_containsFlexibleOcrPhrase(extractedText, indicator)) {
         hasChurchIndicator = true;
         break;
       }
@@ -862,10 +863,42 @@ class DocumentValidationService {
       }
     }
 
+    // A parish certificate is a record, not merely a page mentioning
+    // baptism.  Recognise its usual labelled sections as independent
+    // evidence. This works for modern form/table certificates as well as the
+    // traditional prose layout and avoids assigning unrelated dates or names.
+    final structure = _extractBaptismalCertificateFields(extractedText);
+    final structureLabels = [
+      'name',
+      'full name',
+      'name of child',
+      'date of birth',
+      'place of birth',
+      'date of baptism',
+      'place of baptism',
+      'father',
+      'mother',
+      'parents',
+      'sponsors',
+      'godparents',
+      'minister',
+      'priest',
+      'parish',
+      'diocese',
+    ];
+    final structureLabelCount = structureLabels
+        .where((label) => _containsFlexibleOcrPhrase(extractedText, label))
+        .length;
+    final structuredFieldCount = structure.values
+        .where((value) => value is String && value.trim().isNotEmpty)
+        .length;
+
     print('DEBUG: Template phrases found: $templatePhraseCount/9');
     print('DEBUG: Baptism indicator: $foundIndicator');
     print('DEBUG: Church indicator: $hasChurchIndicator');
     print('DEBUG: Baptism terms count: $baptismTermCount');
+    print('DEBUG: Baptism structure labels: $structureLabelCount');
+    print('DEBUG: Baptism structured fields: $structuredFieldCount');
 
     // EXACT TEMPLATE VALIDATION LOGIC
     bool isValid = false;
@@ -892,6 +925,18 @@ class DocumentValidationService {
       confidenceScore = 75.0;
       warnings.add(
         'Document appears to be a baptism certificate but template structure not fully matched',
+      );
+    } else if (hasChurchIndicator &&
+        baptismTermCount >= 2 &&
+        structureLabelCount >= 3 &&
+        structuredFieldCount >= 2) {
+      // Some dioceses use their own title or have a faded title. Several
+      // labelled baptism record fields plus Catholic context are stronger and
+      // safer evidence than requiring one exact English heading.
+      isValid = true;
+      confidenceScore = 70.0;
+      warnings.add(
+        'Certificate was recognised from its labelled baptism record structure; please review the extracted details.',
       );
     } else if (templatePhraseCount >= 2 && baptismTermCount >= 3) {
       // WEAK MATCH - Some template phrases + baptism terms
@@ -922,6 +967,8 @@ class DocumentValidationService {
           'baptism_indicator': foundIndicator,
           'church_indicator': hasChurchIndicator,
           'baptism_terms_count': baptismTermCount,
+          'baptism_structure_label_count': structureLabelCount,
+          'baptism_structured_field_count': structuredFieldCount,
         },
         errorMessage: null,
       );
@@ -937,6 +984,8 @@ class DocumentValidationService {
         extractedData: {
           'template_phrases_count': templatePhraseCount,
           'baptism_terms_count': baptismTermCount,
+          'baptism_structure_label_count': structureLabelCount,
+          'baptism_structured_field_count': structuredFieldCount,
         },
         errorMessage:
             'Invalid document: Please upload a valid baptism certificate with the proper format.',
@@ -1126,14 +1175,22 @@ class DocumentValidationService {
           }
 
           // `textAnnotations[0].description` contains the complete OCR
-          // reading. Reading every annotation duplicates words and makes
-          // label/value extraction much less reliable.
-          final textAnnotations = firstResponse['textAnnotations'] as List?;
-          if (textAnnotations != null && textAnnotations.isNotEmpty) {
-            final firstAnnotation = textAnnotations.first;
-            final annotationText = firstAnnotation is Map
-                ? firstAnnotation['description']?.toString() ?? ''
-                : '';
+          // reading. Look at every page response: a PDF can have a page where
+          // Document Text Detection is absent while standard Text Detection
+          // still returns clear text. Reading only the first response silently
+          // loses those pages.
+          final annotationText = pageResponses
+              .map((page) {
+                final annotations = page['textAnnotations'];
+                if (annotations is! List || annotations.isEmpty) return '';
+                final firstAnnotation = annotations.first;
+                return firstAnnotation is Map
+                    ? firstAnnotation['description']?.toString() ?? ''
+                    : '';
+              })
+              .where((text) => text.trim().isNotEmpty)
+              .join('\n');
+          if (annotationText.isNotEmpty) {
             final extractedText = _normaliseOcrText(annotationText);
 
             if (extractedText.isNotEmpty) {
@@ -1206,6 +1263,46 @@ class DocumentValidationService {
         .replaceAll(RegExp(r' *\n *'), '\n')
         .replaceAll(RegExp(r'\n{3,}'), '\n\n')
         .trim();
+  }
+
+  /// Normalises only for matching headings and labels, never for values that
+  /// will be offered back to the user. It makes `DATE / OF / BAPTISM`,
+  /// `Date-of-Baptism`, and a lightly broken scan comparable without silently
+  /// changing a person's name.
+  static String _canonicalOcrText(String text) {
+    return _normaliseOcrText(text)
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
+  static bool _containsFlexibleOcrPhrase(String text, String phrase) {
+    final canonicalText = _canonicalOcrText(text);
+    final canonicalPhrase = _canonicalOcrText(phrase);
+    if (canonicalPhrase.isEmpty) return false;
+    if (canonicalText.contains(canonicalPhrase)) return true;
+
+    // Match common, low-risk OCR confusions in labels only. In particular,
+    // `BAPTlSM` and `CERTlFlCATE` must not cause a readable certificate to be
+    // discarded solely because an I/l was read inconsistently.
+    final expression = canonicalPhrase.split('').map((character) {
+      switch (character) {
+        case 'i':
+        case 'l':
+          return '[il1]';
+        case 'o':
+          return '[o0]';
+        case 's':
+          return '[s5]';
+        case ' ':
+          return r'\s+';
+        default:
+          return character;
+      }
+    }).join();
+    return RegExp('\\b$expression\\b', caseSensitive: false)
+        .hasMatch(canonicalText);
   }
 
   static Map<String, dynamic> _visionErrorData(String responseBody) {
@@ -1906,6 +2003,90 @@ class DocumentValidationService {
     final reading = _normaliseOcrText(text).replaceAll('\n', ' ');
     final fields = <String, dynamic>{};
 
+    // Prefer explicit labels whenever they exist.  Certificates are issued in
+    // many layouts: a label can be beside its value, above it in a table, or
+    // split by a faint rule.  These aliases bind the value to its meaning
+    // before the prose-layout fallbacks below are considered.
+    void addLabeledText(String field, List<String> labels) {
+      final value = _extractLabeledValue(text, labels);
+      if (_isPlausibleOcrFieldValue(value)) fields[field] = value;
+    }
+
+    void addLabeledDate(String field, List<String> labels) {
+      final value = _extractLabeledDate(text, labels);
+      if (value.isNotEmpty) fields[field] = value;
+    }
+
+    addLabeledText('full_name', [
+      'name of (?:the )?(?:child|baptized)',
+      'child(?:\'s)? name',
+      'name of person baptized',
+      'name of baptiz(?:ed|and)',
+      'full name',
+      'pangalan ng (?:bata|bininyagan)',
+    ]);
+    addLabeledDate('date_of_birth', [
+      'date of birth',
+      'birth date',
+      'born on',
+      'petsa ng kapanganakan',
+    ]);
+    addLabeledText('place_of_birth', [
+      'place of birth',
+      'place where born',
+      'born in',
+      'lugar ng kapanganakan',
+    ]);
+    addLabeledDate('date_of_baptism', [
+      'date of baptism',
+      'baptism date',
+      'date baptized',
+      'petsa ng binyag',
+      'kailan nabinyagan',
+    ]);
+    addLabeledText('place_of_baptism', [
+      'place of baptism',
+      'church of baptism',
+      'parish of baptism',
+      'lugar ng binyag',
+      'saan nabinyagan',
+    ]);
+    addLabeledText('father_name', [
+      "father(?:'s)?(?: (?:full )?name)?",
+      'name of father',
+      'pangalan ng ama',
+      'ama',
+    ]);
+    addLabeledText('mother_name', [
+      "mother(?:'s)?(?: maiden)?(?: name)?",
+      'name of mother',
+      'pangalan ng ina',
+      'ina',
+    ]);
+    addLabeledText('minister_of_baptism', [
+      'minister of baptism',
+      'officiating (?:priest|minister)',
+      'priest(?:\'s)? name',
+      'pari',
+    ]);
+    addLabeledText('sponsors', [
+      'sponsors?',
+      'godparents?',
+      'ninong at ninang',
+    ]);
+    addLabeledText('parish_name', [
+      'name of parish',
+      'baptizing parish',
+      'parish(?: name)?',
+      'pangalan ng parokya',
+    ]);
+
+    final labeledParents = [fields['father_name'], fields['mother_name']]
+        .whereType<String>()
+        .where((value) => value.isNotEmpty)
+        .join(', ');
+    if (labeledParents.isNotEmpty) fields['parent_names'] = labeledParents;
+
     String valueBefore(String expression, String endExpression) {
       final match = RegExp(
         '$expression\\s+(.{2,140}?)(?=\\s+(?:$endExpression))',
@@ -1919,7 +2100,9 @@ class DocumentValidationService {
       r'(?:this\s+is\s+to\s+certify\s+)?that',
       r'child\s+of|born\s+in|(?:who\s+)?was\s+(?:solemnly\s+)?bapti[sz]ed',
     );
-    if (_isLikelyPersonName(childName)) fields['full_name'] = childName;
+    if (!fields.containsKey('full_name') && _isLikelyPersonName(childName)) {
+      fields['full_name'] = childName;
+    }
 
     // `CHILD OF [father] OF [place] AND [mother] OF [place]` is a separate
     // record section, so extract each parent only within that section.
@@ -1931,8 +2114,12 @@ class DocumentValidationService {
     if (parents != null) {
       final father = _cleanOcrFieldValue(parents.group(1)!);
       final mother = _cleanOcrFieldValue(parents.group(2)!);
-      if (_isLikelyPersonName(father)) fields['father_name'] = father;
-      if (_isLikelyPersonName(mother)) fields['mother_name'] = mother;
+      if (!fields.containsKey('father_name') && _isLikelyPersonName(father)) {
+        fields['father_name'] = father;
+      }
+      if (!fields.containsKey('mother_name') && _isLikelyPersonName(mother)) {
+        fields['mother_name'] = mother;
+      }
       final parentNames = [father, mother]
           .where(_isLikelyPersonName)
           .join(', ');
@@ -1943,18 +2130,28 @@ class DocumentValidationService {
       r'born\s+in',
       r'\d{1,2}\s+(?:day\s+of\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)',
     );
-    if (_isPlausibleOcrFieldValue(bornIn)) fields['place_of_birth'] = bornIn;
+    if (!fields.containsKey('place_of_birth') &&
+        _isPlausibleOcrFieldValue(bornIn)) {
+      fields['place_of_birth'] = bornIn;
+    }
 
     final birthDate = _extractRiteCertificateDate(reading, beforeBaptism: true);
-    if (birthDate.isNotEmpty) fields['date_of_birth'] = birthDate;
+    if (!fields.containsKey('date_of_birth') && birthDate.isNotEmpty) {
+      fields['date_of_birth'] = birthDate;
+    }
     final baptismDate = _extractRiteCertificateDate(reading, beforeBaptism: false);
-    if (baptismDate.isNotEmpty) fields['date_of_baptism'] = baptismDate;
+    if (!fields.containsKey('date_of_baptism') && baptismDate.isNotEmpty) {
+      fields['date_of_baptism'] = baptismDate;
+    }
 
     final minister = valueBefore(
       r'(?:by\s+the\s+reverend|officiating\s+(?:priest|minister)|minister\s+of\s+baptism)',
       r'the\s+sponsors?\s+being|sponsors?\s*(?:being|:)|parish\s+priest|$'
     );
-    if (_isLikelyPersonName(minister)) fields['minister_of_baptism'] = minister;
+    if (!fields.containsKey('minister_of_baptism') &&
+        _isLikelyPersonName(minister)) {
+      fields['minister_of_baptism'] = minister;
+    }
 
     final sponsors = RegExp(
       r'(?:the\s+)?sponsors?\s+(?:being)?\s*[:\-]?\s*(.{2,500}?)(?=\s+(?:parish\s+priest|certified\s+(?:true|correct)|$))',
@@ -1963,7 +2160,8 @@ class DocumentValidationService {
     ).firstMatch(reading);
     if (sponsors != null) {
       final sponsorText = _cleanOcrFieldValue(sponsors.group(1)!);
-      if (_isPlausibleOcrFieldValue(sponsorText)) {
+      if (!fields.containsKey('sponsors') &&
+          _isPlausibleOcrFieldValue(sponsorText)) {
         fields['sponsors'] = sponsorText;
       }
     }
@@ -1972,11 +2170,11 @@ class DocumentValidationService {
 
     final parish = _extractTraditionalBaptismParishName(text);
     if (_isPlausibleOcrFieldValue(parish)) {
-      fields['parish_name'] = parish;
+      fields.putIfAbsent('parish_name', () => parish);
       // Most traditional certificates identify the baptising parish only in
       // the letterhead, so that same labelled institution is the safest
       // available place-of-baptism value.
-      fields['place_of_baptism'] = parish;
+      fields.putIfAbsent('place_of_baptism', () => parish);
     }
     return fields;
   }
@@ -2107,7 +2305,24 @@ class DocumentValidationService {
     for (final label in labels) {
       // OCR can split a printed label across lines or insert extra spaces in
       // a table cell; allow whitespace anywhere a label contains a space.
-      final flexibleLabel = label.replaceAll(' ', r'\s+');
+      // Restrict character-confusion recovery to label matching. Applying it
+      // to a value would risk changing a person's name, but labels such as
+      // `DATE OF BAPTlSM` or `PANGALAN NG BlNYAGAN` are safe to repair.
+      final flexibleLabel = label.split('').map((character) {
+        switch (character) {
+          case 'i':
+          case 'l':
+            return '[il1]';
+          case 'o':
+            return '[o0]';
+          case 's':
+            return '[s5]';
+          case ' ':
+            return r'\s+';
+          default:
+            return character;
+        }
+      }).join();
       final pattern = RegExp(
         '(?:^|\\n|\\b)(?:$flexibleLabel)\\b\\s*[:\\-–—.]?\\s*([^\\n]{2,120})',
         caseSensitive: false,
@@ -2117,7 +2332,7 @@ class DocumentValidationService {
           var value = _cleanOcrFieldValue(match.group(1)!);
           value = value.replaceFirst(
             RegExp(
-                r'\s+(?:sex|gender|father|mother|place|date|citizenship|nationality|informant|attendant|legitimacy|type of birth)\b.*$',
+                r'\s+(?:sex|gender|father|mother|parents?|place|date|citizenship|nationality|informant|attendant|legitimacy|type of birth|baptism|baptized|baptised|minister|priest|sponsors?|godparents?|parish|diocese)\b.*$',
                 caseSensitive: false),
             '',
           );
