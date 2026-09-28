@@ -44,7 +44,7 @@ class DonationFeature extends StatefulWidget {
 class _DonationFeatureState extends State<DonationFeature>
     with SingleTickerProviderStateMixin {
   static const _generalMonetaryDonationDescription =
-      'This monetary donation is considered a general donation for the parish church and will be used to support its ministries, programs, and ongoing needs. If you wish to contribute to a specific cause, please wait for the official donation drive dedicated to that purpose.';
+      'This general donation is for the parish church and will be used to support its ministries, programs, and ongoing needs. If you wish to contribute to a specific cause, please wait for the official donation drive dedicated to that purpose.';
 
   DonationType _selectedType = DonationType.monetary;
   bool _isAnonymous = false;
@@ -677,7 +677,7 @@ class _DonationFeatureState extends State<DonationFeature>
       children: [
         _buildTypeButton(
           type: DonationType.monetary,
-          label: t('Pera', 'Monetary'),
+          label: t('Pangkalahatang Donasyon', 'General Donation'),
           icon: Icons.attach_money,
           description: t('Donasyon sa pera', 'Cash giving'),
           isMobile: isMobile,
@@ -1243,7 +1243,7 @@ class _DonationFeatureState extends State<DonationFeature>
   String _formatDonationType(String donationType) {
     switch (donationType) {
       case 'monetary':
-        return t('Pera', 'Monetary');
+        return t('Pangkalahatang Donasyon', 'General Donation');
       case 'massOffering':
         return t('Handog sa Misa', 'Mass Offering');
       case 'inKind':
@@ -1403,7 +1403,7 @@ class _DonationFeatureState extends State<DonationFeature>
                 border: Border.all(color: ParishColors.borderBlue100),
               ),
               child: Text(
-                'This monetary donation is considered a general donation for the parish church and will be used to support its ministries, programs, and ongoing needs. If you wish to contribute to a specific cause, please wait for the official donation drive dedicated to that purpose.',
+                'This general donation is for the parish church and will be used to support its ministries, programs, and ongoing needs. If you wish to contribute to a specific cause, please wait for the official donation drive dedicated to that purpose.',
                 style: TextStyle(
                   fontSize: isMobile ? 13 : 14,
                   height: 1.45,

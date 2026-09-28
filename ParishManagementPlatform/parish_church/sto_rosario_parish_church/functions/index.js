@@ -1993,6 +1993,171 @@ exports.verifySignupOtpAndCreateAccount = onCall(
   }
 );
 
+const CERTIFICATE_TYPES = {
+  baptism: 'Baptismal Certificate',
+  confirmation: 'Confirmation/Kumpil Certificate',
+  marriage: 'Wedding/Marriage Certificate',
+};
+
+function normalizeCertificateType(value) {
+  const type = String(value || '').trim().toLowerCase();
+  if (type.includes('baptis')) return 'baptism';
+  if (type.includes('confirm') || type.includes('kumpil')) return 'confirmation';
+  if (type.includes('marriage') || type.includes('wedding')) return 'marriage';
+  return type;
+}
+
+async function getCertificateOwnerIds(db, authUid) {
+  const ids = new Set([authUid]);
+  const user = await db.collection('users').where('uid', '==', authUid).limit(1).get();
+  if (!user.empty) {
+    const doc = user.docs[0];
+    ids.add(doc.id);
+    const structuredId = doc.data().structuredId;
+    if (typeof structuredId === 'string' && structuredId) ids.add(structuredId);
+  }
+  return [...ids];
+}
+
+function certificateMailer() {
+  const smtpUser = SMTP_USER.value();
+  return {
+    smtpUser,
+    fromName: SMTP_FROM_NAME.value(),
+    transporter: nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: smtpUser, pass: SMTP_APP_PASSWORD.value() },
+    }),
+  };
+}
+
+exports.getMyCertificateRequests = onCall(
+  { region: 'asia-southeast1' },
+  async (request) => {
+    if (!request.auth) throw new HttpsError('unauthenticated', 'Please sign in to view certificates.');
+    const uid = request.auth.uid;
+    const db = admin.firestore();
+    const ownerIds = await getCertificateOwnerIds(db, uid);
+    const [recordGroups, legacyRecords, requests] = await Promise.all([
+      Promise.all(ownerIds.map((ownerId) => db.collection('certificates')
+        .where('parishionerId', '==', ownerId).limit(100).get())),
+      db.collection('certificate_records').where('userId', '==', uid).limit(100).get(),
+      db.collection('certificate_requests').where('userId', '==', uid).limit(100).get(),
+    ]);
+    const certificateDocs = [...new Map(recordGroups.flatMap((group) => group.docs)
+      .map((doc) => [doc.id, doc])).values()];
+    const available = new Set([...certificateDocs, ...legacyRecords.docs]
+      .map((doc) => normalizeCertificateType(doc.data().certificateType || doc.data().type)));
+    const latestRequests = new Map();
+    for (const doc of requests.docs) {
+      const data = doc.data();
+      const type = String(data.certificateType || '').toLowerCase();
+      const current = latestRequests.get(type);
+      const timestamp = data.requestDate?.toMillis?.() || 0;
+      if (!current || timestamp >= current.timestamp) {
+        latestRequests.set(type, { timestamp, status: data.status, requestDate: data.requestDate?.toDate?.().toISOString() || null });
+      }
+    }
+    return {
+      certificates: Object.keys(CERTIFICATE_TYPES).map((type) => ({
+        certificateType: type,
+        available: available.has(type),
+        ...(latestRequests.has(type) ? latestRequests.get(type) : {}),
+      })),
+    };
+  }
+);
+
+exports.submitCertificateRequest = onCall(
+  { region: 'asia-southeast1' },
+  async (request) => {
+    if (!request.auth) throw new HttpsError('unauthenticated', 'Please sign in to request a certificate.');
+    const type = String(request.data?.certificateType || '').trim().toLowerCase();
+    const certificateName = CERTIFICATE_TYPES[type];
+    if (!certificateName) throw new HttpsError('invalid-argument', 'Select a valid certificate type.');
+    const uid = request.auth.uid;
+    const userEmail = String(request.auth.token.email || '').trim();
+    if (!isValidEmail(userEmail)) throw new HttpsError('failed-precondition', 'Your account needs a registered email address.');
+    const db = admin.firestore();
+    const ownerIds = await getCertificateOwnerIds(db, uid);
+    const recordGroups = await Promise.all(ownerIds.map((ownerId) => db.collection('certificates')
+      .where('parishionerId', '==', ownerId).limit(100).get()));
+    const certificateRecord = recordGroups.flatMap((group) => group.docs).find((doc) =>
+      normalizeCertificateType(doc.data().certificateType || doc.data().type) === type);
+    if (!certificateRecord) throw new HttpsError('failed-precondition', 'No certificate record is linked to your account. Please contact the parish office for assistance.');
+    const existing = await db.collection('certificate_requests')
+      .where('userId', '==', uid).where('certificateType', '==', type)
+      .where('status', 'in', ['Request Sent', 'Processing']).limit(1).get();
+    if (!existing.empty) throw new HttpsError('already-exists', 'You already have an active request for this certificate.');
+    const user = await admin.auth().getUser(uid);
+    const ref = db.collection('certificate_requests').doc();
+    await ref.create({
+      userId: uid,
+      userName: user.displayName || userEmail.split('@')[0],
+      userEmail,
+      certificateType: type,
+      certificateName,
+      certificateRecordId: certificateRecord.id,
+      status: 'Request Sent',
+      requestDate: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return { requestId: ref.id, status: 'Request Sent' };
+  }
+);
+
+async function sendCertificateStatusEmail(data, requestId, status) {
+  const to = String(data.userEmail || '').trim();
+  if (!isValidEmail(to)) return;
+  const { smtpUser, fromName, transporter } = certificateMailer();
+  const type = CERTIFICATE_TYPES[data.certificateType] || data.certificateName || 'Church Certificate';
+  const date = data.requestDate?.toDate?.().toLocaleDateString('en-PH') || 'Not available';
+  const nextSteps = status === 'Completed'
+    ? 'Your certificate request is ready. Please contact or visit the parish office to arrange release according to the parish procedure.'
+    : status === 'Processing'
+      ? 'The parish secretary is processing your request. Please monitor your request status for updates.'
+      : 'Certificate requests may take approximately 1–2 weeks to process. Please monitor your request status for updates from the parish.';
+  await transporter.sendMail({
+    from: `${fromName} <${smtpUser}>`,
+    to,
+    subject: `${type} request: ${status} - Sto. Rosario Parish Church`,
+    text: `Certificate type: ${type}\nCurrent request status: ${status}\nRequest date: ${date}\n\n${nextSteps}\n\nRequest reference: ${requestId}`,
+    html: `<div style="font-family:Arial,sans-serif;line-height:1.6"><h2>Sto. Rosario Parish Church</h2><p>Your certificate request has been updated.</p><p><b>Certificate type:</b> ${escapeHtml(type)}<br><b>Current request status:</b> ${escapeHtml(status)}<br><b>Request date:</b> ${escapeHtml(date)}</p><p>${escapeHtml(nextSteps)}</p><p>Request reference: ${escapeHtml(requestId)}</p></div>`,
+  });
+}
+
+exports.notifyCertificateRequestCreated = onDocumentCreated(
+  { region: 'asia-southeast1', document: 'certificate_requests/{requestId}', secrets: [SMTP_USER, SMTP_APP_PASSWORD, SMTP_FROM_NAME] },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    try {
+      await sendCertificateStatusEmail(snap.data() || {}, event.params.requestId, 'Request Sent');
+      await snap.ref.set({ notifications: { requestSentEmailSentAt: admin.firestore.FieldValue.serverTimestamp() } }, { merge: true });
+    } catch (error) {
+      console.error('notifyCertificateRequestCreated failed', { requestId: event.params.requestId, message: error?.message });
+    }
+  }
+);
+
+exports.notifyCertificateRequestStatusChanged = onDocumentUpdated(
+  { region: 'asia-southeast1', document: 'certificate_requests/{requestId}', secrets: [SMTP_USER, SMTP_APP_PASSWORD, SMTP_FROM_NAME] },
+  async (event) => {
+    const before = event.data?.before?.data() || {};
+    const afterSnap = event.data?.after;
+    const after = afterSnap?.data() || {};
+    if (!afterSnap || before.status === after.status || !['Processing', 'Completed'].includes(after.status)) return;
+    const marker = `${after.status.toLowerCase()}EmailSentAt`;
+    if (after.notifications?.[marker]) return;
+    try {
+      await sendCertificateStatusEmail(after, event.params.requestId, after.status);
+      await afterSnap.ref.set({ notifications: { [marker]: admin.firestore.FieldValue.serverTimestamp() } }, { merge: true });
+    } catch (error) {
+      console.error('notifyCertificateRequestStatusChanged failed', { requestId: event.params.requestId, status: after.status, message: error?.message });
+    }
+  }
+);
+
 exports.notifyBookingPendingEmail = onDocumentCreated(
   {
     region: 'asia-southeast1',

@@ -22,6 +22,7 @@ import '../features/donations/screens/donation_feature.dart';
 import '../features/donations/screens/donation_drives_screen.dart';
 import '../features/contact/screens/contact_screen.dart';
 import '../features/announcements/screens/announcements_screen.dart';
+import '../features/certificates/screens/certificate_requests_screen.dart';
 
 void _showModalNotificationGlobal(
   BuildContext context,
@@ -261,6 +262,7 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
               onMassSchedulePressed: _navigateToMassSchedule,
               onAnnouncementsPressed: _navigateToAnnouncements,
               onDonationDrivesPressed: _navigateToDonationDrives,
+              onCertificatesPressed: _navigateToCertificates,
               onDonatePressed: _navigateToDonate,
               onContactPressed: _navigateToContact,
               onSignInPressed: _showAuthDialog,
@@ -420,8 +422,8 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
 
   void _onNavTap(int index) {
     setState(() {
-      // Guest nav has 2 tabs, others have 4
-      final maxIndex = _isGuest ? 1 : 3;
+      // Guests have 2 tabs; signed-in parishioners have 5.
+      final maxIndex = _isGuest ? 1 : 4;
       _currentNavIndex = index.clamp(0, maxIndex);
     });
   }
@@ -517,6 +519,8 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
           onStartBooking: () => _onNavTap(0),
         );
       case 3:
+        return CertificateRequestsScreen(isTagalog: _isLanguageTagalog);
+      case 4:
         return ProfileScreen(
           userName: widget.userName,
           onLogoutPressed: _logout,
@@ -930,6 +934,26 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
       context,
       MaterialPageRoute(
         builder: (context) => DonationDrivesScreen(isTagalog: _isLanguageTagalog),
+      ),
+    );
+  }
+
+  void _navigateToCertificates() {
+    _scaffoldKey.currentState?.closeDrawer();
+    if (_isGuest) {
+      _showModalNotification(
+        _t('Mag-sign in upang makita ang iyong mga sertipiko.',
+            'Please sign in to view your church certificates.'),
+        bgColor: Colors.red,
+      );
+      return;
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => CertificateRequestsScreen(
+          isTagalog: _isLanguageTagalog,
+        ),
       ),
     );
   }

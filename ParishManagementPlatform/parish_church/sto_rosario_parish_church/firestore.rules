@@ -274,6 +274,35 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
+    // Certificate records are private to the linked parishioner. Parish staff
+    // manage the records; users can only read records linked to their own UID.
+    match /certificates/{certificateId} {
+      allow read: if isSignedIn() &&
+        (resource.data.userId == request.auth.uid || isAdmin());
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // Parish verified records use userId (Firebase Auth UID) and
+    // certificateType ('baptism', 'confirmation', or 'marriage'). Parishioners
+    // can only see their own record metadata; record creation is staff managed.
+    match /certificate_records/{recordId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // Requests are created by the authenticated callable after it verifies a
+    // linked certificate_records entry. Only staff may change request status.
+    match /certificate_requests/{requestId} {
+      allow read: if isSignedIn() &&
+        (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if false;
+      allow update: if isSignedIn() && isAdmin() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'updatedAt', 'adminNotes'
+        ]) && request.resource.data.status in ['Request Sent', 'Processing', 'Completed'];
+      allow delete: if false;
+    }
+
     match /announcements/{announcementId} {
       allow read: if true;
       allow create, update, delete: if false;

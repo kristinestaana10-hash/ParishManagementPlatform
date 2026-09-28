@@ -7,6 +7,7 @@ class ParishSidebarDrawer extends StatelessWidget {
   final VoidCallback onMassSchedulePressed;
   final VoidCallback onAnnouncementsPressed;
   final VoidCallback onDonationDrivesPressed;
+  final VoidCallback onCertificatesPressed;
   final VoidCallback onDonatePressed;
   final VoidCallback onContactPressed;
   final VoidCallback? onSignInPressed;
@@ -18,6 +19,7 @@ class ParishSidebarDrawer extends StatelessWidget {
     required this.onMassSchedulePressed,
     required this.onAnnouncementsPressed,
     required this.onDonationDrivesPressed,
+    required this.onCertificatesPressed,
     required this.onDonatePressed,
     required this.onContactPressed,
     this.onSignInPressed,
@@ -122,6 +124,14 @@ class ParishSidebarDrawer extends StatelessWidget {
                   'Mga Donasyon',
                   onDonationDrivesPressed,
                 ),
+                if (isGuest)
+                  _buildMenuItem(
+                    context,
+                    Icons.workspace_premium_outlined,
+                    'My Church Certificates',
+                    'Mga Sertipiko sa Simbahan',
+                    onCertificatesPressed,
+                  ),
                 _buildMenuItem(
                   context,
                   Icons.mail_outline,

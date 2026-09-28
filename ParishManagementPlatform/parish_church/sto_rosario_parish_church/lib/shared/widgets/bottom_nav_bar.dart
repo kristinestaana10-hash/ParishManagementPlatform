@@ -72,6 +72,11 @@ class ParishBottomNavBar extends StatelessWidget {
                   label: 'Bookings',
                 ),
                 BottomNavigationBarItem(
+                  icon: const Icon(Icons.workspace_premium_outlined, size: 24),
+                  activeIcon: _buildActiveIcon(Icons.workspace_premium),
+                  label: 'Certificates',
+                ),
+                BottomNavigationBarItem(
                   icon: const Icon(Icons.person_outline, size: 24),
                   activeIcon: _buildActiveIcon(Icons.person),
                   label: 'Profile',
