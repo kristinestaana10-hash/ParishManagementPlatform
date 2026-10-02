@@ -1,8 +1,11 @@
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
 import '../../../core/design/colors.dart';
 import '../../../core/design/responsive.dart';
+import 'certificate_viewer_screen.dart';
 
 class CertificateRequestsScreen extends StatefulWidget {
   final bool isTagalog;
@@ -35,9 +38,60 @@ class _CertificateRequestsScreenState extends State<CertificateRequestsScreen> {
         .httpsCallable('getMyCertificateRequests')
         .call();
     final data = Map<String, dynamic>.from(result.data as Map);
-    return (data['certificates'] as List? ?? const [])
+    final certificates = (data['certificates'] as List? ?? const [])
         .map((item) => Map<String, dynamic>.from(item as Map))
         .toList();
+
+    // Read attachments directly under the Firestore owner-only rule as well.
+    // This lets the app show an attached file even before the callable is redeployed.
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return certificates;
+    final requestSnapshot = await FirebaseFirestore.instance
+        .collection('certificate_requests')
+        .where('userId', isEqualTo: uid)
+        .get();
+    final attachedFiles = <String, ({String url, String requestId, int timestamp})>{};
+    for (final doc in requestSnapshot.docs) {
+      final item = doc.data();
+      final type = _certificateTypeKey(item['certificateType'] ?? item['type']);
+      final url = item['softCopyUrl'];
+      if (type == null || url is! String) continue;
+      final uri = Uri.tryParse(url.trim());
+      if (uri == null || uri.scheme != 'https' || uri.host.isEmpty) continue;
+      final date = item['requestDate'];
+      final timestamp = date is Timestamp
+          ? date.millisecondsSinceEpoch
+          : date is DateTime
+              ? date.millisecondsSinceEpoch
+              : 0;
+      final previous = attachedFiles[type];
+      if (previous == null || timestamp >= previous.timestamp) {
+        attachedFiles[type] = (
+          url: url.trim(),
+          requestId: doc.id,
+          timestamp: timestamp,
+        );
+      }
+    }
+    return certificates.map((certificate) {
+      final type = _certificateTypeKey(certificate['certificateType']);
+      final attachment = type == null ? null : attachedFiles[type];
+      return attachment == null
+          ? certificate
+          : {
+              ...certificate,
+              'softCopyUrl': attachment.url,
+              'softCopyRequestId': attachment.requestId,
+            };
+    }).toList();
+  }
+
+  String? _certificateTypeKey(Object? value) {
+    final type = value?.toString().trim().toLowerCase() ?? '';
+    if (type.contains('baptis')) return 'baptism';
+    if (type.contains('confirm') || type.contains('kumpil')) return 'confirmation';
+    if (type.contains('marriage') || type.contains('wedding')) return 'marriage';
+    return null;
   }
 
   Future<void> _request(String type) async {
@@ -98,6 +152,9 @@ class _CertificateRequestsScreenState extends State<CertificateRequestsScreen> {
             for (final item in snapshot.data ?? const <Map<String, dynamic>>[])
               item['certificateType'] as String: item,
           };
+          final availableTypes = _types.keys
+              .where((type) => byType[type]?['available'] == true)
+              .toList();
           return RefreshIndicator(
             color: ParishColors.primaryBlue,
             onRefresh: () async {
@@ -120,8 +177,26 @@ class _CertificateRequestsScreenState extends State<CertificateRequestsScreen> {
                   ),
                 ),
                 const SizedBox(height: 20),
-                for (final entry in _types.entries)
-                  _buildCertificateCard(entry.key, entry.value, byType[entry.key]),
+                if (availableTypes.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 24),
+                    child: Text(
+                      'No church certificate records are linked to your account yet. Please contact the parish office for assistance.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: ParishColors.textGray600,
+                        height: 1.5,
+                      ),
+                    ),
+                  )
+                else
+                  for (final entry in _types.entries)
+                    if (byType[entry.key]?['available'] == true)
+                    _buildCertificateCard(
+                      entry.key,
+                      entry.value,
+                      byType[entry.key],
+                    ),
               ],
             ),
           );
@@ -137,17 +212,22 @@ class _CertificateRequestsScreenState extends State<CertificateRequestsScreen> {
   ) {
     final available = data?['available'] == true;
     final status = data?['status'] as String?;
+    final softCopyUrl = data?['softCopyUrl'] as String?;
+    final softCopyRequestId = data?['softCopyRequestId'] as String?;
     final requestDate = data?['requestDate'] as String?;
     final parsedDate = requestDate == null ? null : DateTime.tryParse(requestDate);
-    final statusDescription = switch (status) {
-      'Request Sent' => 'Your request has been successfully submitted to the parish.',
-      'Processing' => 'The parish secretary is currently processing your request.',
-      'Completed' => 'Your certificate request is complete and ready based on the parish release procedure.',
+    final normalizedStatus = status?.trim().toLowerCase();
+    final statusDescription = switch (normalizedStatus) {
+      'request sent' => 'Your request has been successfully submitted to the parish.',
+      'processing' => 'The parish secretary is currently processing your request.',
+      'completed' => 'Your certificate request is complete and ready based on the parish release procedure.',
+      'ready to pick up' || 'ready for pickup' || 'ready to pickup' =>
+        'Your certificate is ready to pick up at the parish office.',
       _ => null,
     };
-    final statusColor = switch (status) {
-      'Completed' => ParishColors.greenSuccessDark,
-      'Processing' => ParishColors.primaryBlue,
+    final statusColor = switch (normalizedStatus) {
+      'completed' || 'ready to pick up' || 'ready for pickup' || 'ready to pickup' => ParishColors.greenSuccessDark,
+      'processing' => ParishColors.primaryBlue,
       _ => ParishColors.darkGold,
     };
     final icon = switch (type) {
@@ -321,6 +401,13 @@ class _CertificateRequestsScreenState extends State<CertificateRequestsScreen> {
                   ],
                 ),
               ),
+            if (softCopyUrl != null &&
+                softCopyUrl.isNotEmpty &&
+                softCopyRequestId != null &&
+                softCopyRequestId.isNotEmpty) ...[
+              const SizedBox(height: 14),
+              SizedBox(width: double.infinity, child: OutlinedButton.icon(onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => CertificateViewerScreen(title: title, requestId: softCopyRequestId))), icon: const Icon(Icons.visibility_outlined), label: const Text('View soft copy'))),
+            ],
           ],
         ),
       ),
@@ -384,6 +471,7 @@ class _MessagePanel extends StatelessWidget {
               style: const TextStyle(color: ParishColors.textGray700),
             ),
             if (action != null) action!,
+
           ],
         ),
       ),

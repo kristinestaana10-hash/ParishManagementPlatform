@@ -123,42 +123,6 @@ extension SacramentTypeExtension on SacramentType {
     }
   }
 
-  String fullDescription(bool isTagalog) {
-    switch (this) {
-      case SacramentType.baptism:
-        return isTagalog
-            ? 'Ang binyag ay ang unang sakramento ng pagiging Kristiyano. Ito ang nagbibigay ng bagong buhay kay Kristo, nag-aalis ng orihinal na kasalanan, at tinatanggap ang binyagan bilang kasapi ng Simbahan.'
-            : 'Baptism is the first sacrament of Christian initiation. It gives new life in Christ, frees the person from original sin, and welcomes them as a member of the Church.';
-      case SacramentType.confirmation:
-        return isTagalog
-            ? 'Ang Kumpil ay nagbibigay ng espesyal na pagbubuhos ng Espiritu Santo na mas lalong nagpapatatag at nagpapatibay sa ating binyag upang maging mga saksi ni Kristo.'
-            : 'Confirmation brings a special outpouring of the Holy Spirit that deepens and strengthens baptismal grace, empowering us to become true witnesses of Christ.';
-      case SacramentType.wedding:
-        return isTagalog
-            ? 'Ang Kasal ay isang banal na kasunduan sa pagitan ng lalaki at babae, na tinataguyod ng Diyos bilang isang panghabambuhay na pagsasama ng pagmamahalan at katapatan.'
-            : 'Holy Matrimony is a sacred covenant between a man and a woman, established by God as a lifelong partnership of love and fidelity.';
-      case SacramentType.funeral:
-        return isTagalog
-            ? 'Ang Misa para sa Yumao ay isang panalangin ng Simbahan para sa kaluluwa ng namayapa, na humihingi sa awa ng Diyos upang siya ay makapasok sa buhay na walang hanggan.'
-            : 'The Funeral Mass is a prayer of the Church offering the soul of the departed to God, asking for His mercy so they may enter eternal life.';
-      case SacramentType.houseBlessing:
-        return isTagalog
-            ? 'Ang pagbabasbas ng bahay ay isang panalangin upang hilingin ang gabay at proteksyon ng Diyos para sa tahanan at sa lahat ng naninirahan dito.'
-            : 'House blessing is a prayer asking for God\'s light, guidance, and protection for a home and all who dwell within it.';
-      case SacramentType.anointing:
-        return isTagalog
-            ? 'Ang Pagpapahid sa May Sakit ay nagbibigay ng biyaya ng Espiritu Santo na nagdudulot ng lakas, kapayapaan, at tapang sa mga nakakaranas ng matinding karamdaman.'
-            : 'The Anointing of the Sick confers a special grace providing strength, peace, and courage to endure the difficulties accompanying serious illness or old age.';
-      case SacramentType.massIntention:
-        return isTagalog
-            ? 'Ang pag-aalay ng intensyon sa Misa ay ang paglalaan ng mga panalangin ng Simbahan para sa mga partikular na pangangailangan, pasasalamat, o para sa mga kaluluwa ng mga namayapa.'
-            : 'Offering a Mass intention is a way to apply the graces of the Eucharistic sacrifice for specific needs, thanksgiving, or the souls of the faithfully departed.';
-      case SacramentType.firstCommunion:
-        return isTagalog
-            ? 'Ang Unang Komunyon ay ang unang pagtanggap ng Banal na Eukaristiya. Isang espesyal na pagdiriwang para sa mga mag-aaral na naghahanda para sa kanilang unang pagtanggap ng katawan at dugo ni Kristo.'
-            : 'First Communion is the first reception of the Holy Eucharist. A special celebration for students preparing for their first reception of the Body and Blood of Christ.';
-    }
-  }
 }
 
 enum BaptismTypeChoice { private, public }
@@ -619,6 +583,8 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       {}; // Track uploaded images per requirement
   final Map<int, DocumentValidationResult> _validationResults = {};
   final Map<int, bool> _isValidatingDocuments = {};
+  final Map<String, Map<String, String>> _existingCertificateCopies = {};
+  bool _certificateCopiesLoading = true;
 
   // Age eligibility variables
   int? _userAge;
@@ -636,6 +602,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     _controllers = {};
     _dropdownValues = {};
     _loadBookingFormDefinition();
+    _loadExistingCertificateCopies();
     _loadUserAge();
     _loadCurrentParishPriest();
     // Pre-load booking counts for calendar (except Mass Intention)
@@ -647,6 +614,103 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     // change is reflected without returning to the form or using fixed slots.
     _loadMassIntentionSchedule();
     _listenForMassScheduleChanges();
+  }
+
+  Future<void> _loadExistingCertificateCopies() async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) {
+      if (mounted) setState(() => _certificateCopiesLoading = false);
+      return;
+    }
+    try {
+      final requests = await FirebaseFirestore.instance
+          .collection('certificate_requests')
+          .where('userId', isEqualTo: uid)
+          .get();
+      final copies = <String, Map<String, String>>{};
+      for (final request in requests.docs) {
+        final data = request.data();
+        final status = (data['status'] ?? '').toString().trim().toLowerCase();
+        final isIssued = status == 'completed' ||
+            status == 'ready to pick up' ||
+            status == 'ready for pickup' ||
+            status == 'ready to pickup';
+        final urlValue = data['softCopyUrl'];
+        if (!isIssued || urlValue is! String) continue;
+        final url = urlValue.trim();
+        final uri = Uri.tryParse(url);
+        if (uri == null || uri.scheme != 'https' || uri.host.isEmpty) continue;
+        final type = _certificateRequestType(
+          data['certificateType'] ?? data['certificateName'],
+        );
+        if (type == null) continue;
+        final previous = copies[type];
+        final date = data['requestDate'];
+        final timestamp = date is Timestamp
+            ? date.millisecondsSinceEpoch
+            : date is DateTime
+                ? date.millisecondsSinceEpoch
+                : 0;
+        final previousDate = int.tryParse(previous?['timestamp'] ?? '') ?? -1;
+        if (previous == null || timestamp >= previousDate) {
+          copies[type] = {
+            'requestId': request.id,
+            'url': url,
+            'timestamp': timestamp.toString(),
+            'certificateName': (data['certificateName'] ??
+                    data['certificateType'] ??
+                    'Church Certificate')
+                .toString(),
+          };
+        }
+      }
+      if (mounted) {
+        setState(() {
+          _existingCertificateCopies
+            ..clear()
+            ..addAll(copies);
+          _certificateCopiesLoading = false;
+        });
+      }
+    } catch (error) {
+      debugPrint('Could not load existing parish certificates: $error');
+      if (mounted) setState(() => _certificateCopiesLoading = false);
+    }
+  }
+
+  String? _certificateRequestType(Object? value) {
+    final type = value?.toString().trim().toLowerCase() ?? '';
+    if (type == 'baptism' || type.contains('baptis') || type.contains('binyag')) {
+      return 'baptism';
+    }
+    if (type == 'confirmation' ||
+        type.contains('confirm') ||
+        type.contains('kumpil')) {
+      return 'confirmation';
+    }
+    if (type == 'marriage' ||
+        type.contains('wedding') ||
+        type.contains('kasal') ||
+        type.contains('marriage certificate') ||
+        type.contains('certificate of marriage')) {
+      return 'marriage';
+    }
+    return null;
+  }
+
+  String? _certificateTypeForRequirement(String requirement) {
+    final text = requirement.toLowerCase();
+    if (text.contains('baptism') || text.contains('binyag')) return 'baptism';
+    if (text.contains('confirmation') || text.contains('kumpil')) {
+      return 'confirmation';
+    }
+    if (text.contains('marriage certificate') ||
+        text.contains('certificate of marriage') ||
+        text.contains('wedding certificate') ||
+        text.contains('sertipiko ng kasal')) {
+      return 'marriage';
+    }
+    return null;
   }
 
   List<String> _massScheduleTextsFromProfile(dynamic profile) {
@@ -1850,9 +1914,39 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           );
         }
       } else {
-        print(
-          'DEBUG: Skipping requirement ${_data.requirements[i]} - missing file or validation',
-        );
+        final certificateType =
+            _certificateTypeForRequirement(_data.requirements[i]);
+        final existingCertificate = certificateType == null
+            ? null
+            : _existingCertificateCopies[certificateType];
+        if (existingCertificate != null) {
+          try {
+            final requirementId = await FirebaseService.instance
+                .saveParishCertificateRequirement(
+                  sacramentType: widget.sacramentType.name,
+                  requirementType: _data.requirements[i],
+                  certificateRequestId: existingCertificate['requestId']!,
+                  certificateUrl: existingCertificate['url']!,
+                  certificateName: existingCertificate['certificateName']!,
+                );
+            debugPrint(
+              'Linked parish certificate to booking requirement $requirementId',
+            );
+            continue;
+          } catch (error) {
+            debugPrint(
+              'Could not link parish certificate for ${_data.requirements[i]}: $error',
+            );
+            _showModalNotificationGlobal(
+              context,
+              widget.isTagalog
+                  ? 'Hindi mai-link ang kasalukuyang sertipiko: ${_data.requirements[i]}'
+                  : 'Could not link the existing certificate: ${_data.requirements[i]}',
+              bgColor: Colors.red,
+            );
+          }
+        }
+        print('DEBUG: Skipping requirement ${_data.requirements[i]} - no upload or parish certificate');
       }
     }
 
@@ -1981,20 +2075,6 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             return;
           }
 
-          final parsed = DateTime.tryParse(date);
-          final isSunday = parsed != null && parsed.weekday == DateTime.sunday;
-          final normalized = time.replaceAll(' ', '').toLowerCase();
-          final isEight = normalized.contains('8:00');
-          if (isEight && !isSunday) {
-            _showModalNotificationGlobal(
-              context,
-              widget.isTagalog
-                  ? 'Ang 8:00 AM ay para lamang sa Linggo.'
-                  : '8:00 AM is available on Sundays only.',
-              bgColor: Colors.red,
-            );
-            return;
-          }
         }
       }
 
@@ -2148,6 +2228,15 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       );
     }
 
+    // Reuse a matching issued certificate from this parishioner's own records.
+    final certificateType = _certificateTypeForRequirement(requirement);
+    final existingCertificate = certificateType == null
+        ? null
+        : _existingCertificateCopies[certificateType];
+    final isSatisfiedByParishRecord = existingCertificate != null;
+    final isCheckingParishRecords =
+        certificateType != null && _certificateCopiesLoading;
+
     // Regular requirement item with upload functionality
     final isUploaded = _uploadedRequirementImages[index] != null;
     final file = _uploadedRequirementImages[index];
@@ -2166,7 +2255,11 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             decoration: BoxDecoration(
               border: Border.all(color: Colors.grey.shade300),
               borderRadius: BorderRadius.circular(10),
-              color: isUploaded ? Colors.blue.shade50 : Colors.grey.shade50,
+              color: isSatisfiedByParishRecord
+                  ? Colors.green.shade50
+                  : isUploaded
+                      ? Colors.blue.shade50
+                      : Colors.grey.shade50,
             ),
             padding: const EdgeInsets.all(12.0),
             child: Row(
@@ -2192,24 +2285,48 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                         ],
                       ),
                       const SizedBox(height: 4),
-                      Text(
-                        fileName,
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey[600],
-                          fontStyle: isUploaded
-                              ? FontStyle.normal
-                              : FontStyle.italic,
+                      if (isSatisfiedByParishRecord)
+                        const Row(
+                          children: [
+                            Icon(Icons.check_circle, color: Colors.green, size: 16),
+                            SizedBox(width: 4),
+                            Expanded(
+                              child: Text(
+                                'Already available in church records',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.green,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ],
+                        )
+                      else if (isCheckingParishRecords)
+                        const Text(
+                          'Checking church records…',
+                          style: TextStyle(fontSize: 12, color: Colors.grey),
+                        )
+                      else
+                        Text(
+                          fileName,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey[600],
+                            fontStyle: isUploaded
+                                ? FontStyle.normal
+                                : FontStyle.italic,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
                     ],
                   ),
                 ),
                 const SizedBox(width: 12),
-                ElevatedButton.icon(
-                  onPressed: isValidating
+                if (!isSatisfiedByParishRecord)
+                  ElevatedButton.icon(
+                  onPressed: isValidating || isCheckingParishRecords
                       ? null
                       : () => _uploadRequirementImage(index),
                   icon: isValidating
@@ -2242,7 +2359,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                       vertical: 10,
                     ),
                   ),
-                ),
+                  ),
               ],
             ),
           ),
@@ -2774,33 +2891,12 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   }
 
   Future<List<String>> _assistantCandidateTimesForDate(DateTime date) async {
-    if (widget.sacramentType == SacramentType.massIntention) {
-      final times = <TimeOfDay>[];
-      for (final scheduleText in _massScheduleTexts) {
-        if (!_scheduleTextAppliesToDate(scheduleText, date)) continue;
-        for (final time in _extractMassTimesFromText(scheduleText)) {
-          if (_isPastMassIntentionTime(date, time)) continue;
-          final exists = times.any(
-            (item) => item.hour == time.hour && item.minute == time.minute,
-          );
-          if (!exists) times.add(time);
-        }
-      }
-      times.sort(
-        (a, b) => (a.hour * 60 + a.minute).compareTo(b.hour * 60 + b.minute),
-      );
-      return times.map(_formatTimeOfDay).toList();
-    }
-
-    if (widget.sacramentType == SacramentType.baptism &&
-        date.weekday == DateTime.sunday) {
-      final sundayTime =
-          await _loadSundayBaptismTime(date) ??
-          _formatTimeOfDay(const TimeOfDay(hour: 9, minute: 0));
-      return [sundayTime];
-    }
-
-    return const ['8:00 AM', '10:00 AM', '2:00 PM', '4:00 PM'];
+    return _standardBookingTimeSlots()
+        .where((time) =>
+            widget.sacramentType != SacramentType.massIntention ||
+            !_isPastMassIntentionTime(date, time))
+        .map(_formatTimeOfDay)
+        .toList(growable: false);
   }
 
   bool _isActiveBookingStatus(String status) {
@@ -3503,12 +3599,22 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     final timeKeys = _selectedScheduleTimeKeys();
     if (dateKeys.isEmpty || timeKeys.isEmpty) return;
 
+    String formFieldKey(List<String> keys) => keys.firstWhere(
+      (key) => _data.fields.contains(key),
+      orElse: () => keys.first,
+    );
+
+    final dateKey = formFieldKey(dateKeys);
+    final timeKey = formFieldKey(timeKeys);
+
     final sundayBaptism =
         widget.sacramentType == SacramentType.baptism &&
         slot.date.weekday == DateTime.sunday;
     setState(() {
-      _controllers[dateKeys.first]?.text = slot.dateValue;
-      _controllers[timeKeys.first]?.text = slot.timeValue;
+      _controllers.putIfAbsent(dateKey, TextEditingController.new).text =
+          slot.dateValue;
+      _controllers.putIfAbsent(timeKey, TextEditingController.new).text =
+          slot.timeValue;
       if (widget.sacramentType == SacramentType.baptism) {
         _isSundayBaptismDate = sundayBaptism;
         _sundayBaptismTime = sundayBaptism ? slot.timeValue : null;
@@ -3520,9 +3626,10 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         _dropdownValues['Day (Araw)'] = day;
       }
       if (widget.sacramentType == SacramentType.massIntention) {
-        _controllers['Time of Mass (Oras ng Misa)']?.text = slot.timeValue;
+        _controllers[timeKey]!.text = slot.timeValue;
       }
     });
+    _refreshStandardSlotAvailability(slot.dateValue);
   }
 
   void _showAIBookingAssistantModal({bool manual = false}) {
@@ -3970,7 +4077,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     if (extracted == null) return null;
 
     final match = RegExp(
-      r'^(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?\$',
+      r'^(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?$',
     ).firstMatch(extracted.trim());
     if (match == null) return null;
 
@@ -4714,7 +4821,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     final isTagalog = widget.isTagalog;
     final title = widget.sacramentType.label(isTagalog);
 
-    // Show loading indicator while checking age eligibility
+    // Show loading indicator while checking age eligibility.
     if (_ageLoading) {
       return Scaffold(
         backgroundColor: ParishColors.bgBlue50,
@@ -5443,60 +5550,38 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       .map((word) => word[0].toUpperCase() + word.substring(1))
       .join(' ');
 
-  List<TimeOfDay> _standardBookingTimeSlots([DateTime? date]) {
-    final bookingDate = date ?? DateTime.tryParse(_selectedScheduleDate());
-    if (bookingDate == null) return const [];
-
-    // Each booking and Mass reserves a 90-minute interval. Generate each
-    // booking slot around the Mass intervals rather than exposing Mass times
-    // themselves as bookable options.
-    const slotLengthMinutes = 90;
-    final massStarts = <int>[];
-    for (final scheduleText in _massScheduleTexts) {
-      if (!_scheduleTextAppliesToDate(scheduleText, bookingDate)) continue;
-      for (final time in _extractMassTimesFromText(scheduleText)) {
+  List<TimeOfDay> _standardBookingTimeSlots() {
+    final times = <TimeOfDay>[];
+    final seen = <int>{};
+    for (final entry in _data.fieldDefinitions.entries) {
+      final fieldName = entry.key.toLowerCase();
+      final definition = entry.value;
+      final type = (definition['type'] ?? '').toString().toLowerCase();
+      if (type != 'time' &&
+          !fieldName.contains('time') &&
+          !fieldName.contains('oras')) {
+        continue;
+      }
+      for (final time in _configuredTimeOptions(definition)) {
         final minutes = time.hour * 60 + time.minute;
-        if (!massStarts.contains(minutes)) massStarts.add(minutes);
+        if (seen.add(minutes)) times.add(time);
       }
     }
-    if (massStarts.isEmpty) return const [];
-    massStarts.sort();
+    return times;
+  }
 
-    bool overlapsMass(int start) => massStarts.any((massStart) {
-          final end = start + slotLengthMinutes;
-          final massEnd = massStart + slotLengthMinutes;
-          return start < massEnd && end > massStart;
-        });
-
-    int nextAvailableStart(int preferredStart) {
-      var candidate = preferredStart;
-      while (overlapsMass(candidate)) {
-        final overlappingMassEnds = massStarts
-            .where((massStart) =>
-                candidate < massStart + slotLengthMinutes &&
-                candidate + slotLengthMinutes > massStart)
-            .map((massStart) => massStart + slotLengthMinutes);
-        candidate = overlappingMassEnds.reduce(
-          (latest, value) => value > latest ? value : latest,
-        );
-      }
-      return candidate;
+  List<TimeOfDay> _configuredTimeOptions(Map<String, dynamic> definition) {
+    final options = definition['options'];
+    if (options is! List) return const [];
+    final times = <TimeOfDay>[];
+    final seen = <int>{};
+    for (final option in options) {
+      final time = _parseTimeOfDay(option?.toString() ?? '');
+      if (time == null) continue;
+      final minutes = time.hour * 60 + time.minute;
+      if (seen.add(minutes)) times.add(time);
     }
-
-    // These are session windows, not booking-time values: two slots are
-    // generated in the morning window and two in the afternoon window. Each
-    // candidate moves forward only when a current Mass interval blocks it.
-    const morningWindowStart = 8 * 60;
-    const afternoonWindowStart = 14 * 60;
-    final firstMorning = nextAvailableStart(morningWindowStart);
-    final secondMorning = nextAvailableStart(firstMorning + slotLengthMinutes);
-    final firstAfternoon = nextAvailableStart(afternoonWindowStart);
-    final secondAfternoon =
-        nextAvailableStart(firstAfternoon + slotLengthMinutes);
-
-    return [firstMorning, secondMorning, firstAfternoon, secondAfternoon]
-        .map((minutes) => TimeOfDay(hour: minutes ~/ 60, minute: minutes % 60))
-        .toList(growable: false);
+    return times;
   }
 
   Future<void> _refreshStandardSlotAvailability(String date) async {
@@ -5513,9 +5598,21 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     } else {
       _standardSlotAvailabilityLoadingDates.add(date);
     }
-    final allSlots = _standardBookingTimeSlots(DateTime.tryParse(date))
+    final allSlots = _standardBookingTimeSlots()
         .map(_formatTimeOfDay)
         .toList();
+    if (allSlots.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _availableStandardSlotsByDate[date] = const [];
+          _standardSlotAvailabilityLoadingDates.remove(date);
+        });
+      } else {
+        _availableStandardSlotsByDate[date] = const [];
+        _standardSlotAvailabilityLoadingDates.remove(date);
+      }
+      return;
+    }
     try {
       final availableSlots = await FirebaseService.instance.getAvailableTimeSlots(
         date: date,
@@ -5620,15 +5717,13 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     if (fieldType == 'time' ||
         normalized.contains('time') ||
         normalized.contains('oras')) {
-      final isMassIntention = widget.sacramentType == SacramentType.massIntention;
       return _buildTimeField(
         label,
         key: field,
         required: required,
-        allowedTimes: isMassIntention
-            ? _massIntentionAllowedTimesForSelectedDate()
-            : _standardBookingTimeSlots(),
-        disabled: isMassIntention && _selectedScheduleDate().isEmpty,
+        allowedTimes: _configuredTimeOptions(definition),
+        disabled: widget.sacramentType == SacramentType.massIntention &&
+            _selectedScheduleDate().isEmpty,
         dropdownOnly: true,
       );
     }

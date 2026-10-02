@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/design/colors.dart';
 import '../../../core/services/firebase_service.dart';
 
@@ -114,8 +117,27 @@ Answer questions accurately about:
 class ChatMessage {
   final String text;
   final bool isUser;
+  final DateTime createdAt;
+  final bool isWelcome;
 
-  ChatMessage({required this.text, required this.isUser});
+  ChatMessage({
+    required this.text,
+    required this.isUser,
+    DateTime? createdAt,
+    this.isWelcome = false,
+  }) : createdAt = createdAt ?? DateTime.now();
+
+  Map<String, dynamic> toMap() => {
+    'text': text,
+    'isUser': isUser,
+    'createdAt': createdAt.toIso8601String(),
+  };
+
+  factory ChatMessage.fromMap(Map<String, dynamic> map) => ChatMessage(
+    text: map['text'] as String? ?? '',
+    isUser: map['isUser'] as bool? ?? false,
+    createdAt: DateTime.tryParse(map['createdAt'] as String? ?? ''),
+  );
 }
 
 class AIChatScreen extends StatefulWidget {
@@ -128,9 +150,15 @@ class AIChatScreen extends StatefulWidget {
 }
 
 class _AIChatScreenState extends State<AIChatScreen> {
+  static const String _historyKey = 'parish_ai_chat_history_v1';
+  static const String _welcomeText =
+      "Hello! 👋 I'm the Parish AI Assistant.\n\nHow can I help you today?\n\nYou can ask me about:\n• Parish services\n• Sacrament requirements\n• Fees\n• Schedules\n• Bookings\n• Parish activities";
+
   final TextEditingController _messageController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
   final List<ChatMessage> _messages = [];
   bool _isLoading = false;
+  bool _isHistoryLoading = true;
   late bool _currentLanguageIsTagalog;
 
   @override
@@ -138,11 +166,105 @@ class _AIChatScreenState extends State<AIChatScreen> {
     super.initState();
     _currentLanguageIsTagalog = widget.isTagalog;
     _messages.add(
-      ChatMessage(
-        text: 'Hello! I am your Parish Assistant. How can I help you today?',
-        isUser: false,
+      ChatMessage(text: _welcomeText, isUser: false, isWelcome: true),
+    );
+    _loadChatHistory();
+  }
+
+  Future<void> _loadChatHistory() async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final encoded = preferences.getString(_historyKey);
+      if (encoded != null) {
+        final decoded = jsonDecode(encoded);
+        if (decoded is List) {
+          final history = decoded
+              .whereType<Map>()
+              .map(
+                (entry) =>
+                    ChatMessage.fromMap(Map<String, dynamic>.from(entry)),
+              )
+              .where((message) => message.text.isNotEmpty)
+              .toList();
+          if (history.isNotEmpty && mounted) {
+            setState(() {
+              _messages
+                ..clear()
+                ..addAll(history);
+            });
+          }
+        }
+      }
+    } catch (error) {
+      debugPrint('Could not restore local parish chat history: $error');
+    } finally {
+      if (mounted) {
+        setState(() => _isHistoryLoading = false);
+        _scrollToLatest();
+      }
+    }
+  }
+
+  Future<void> _saveChatHistory() async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      final history = _messages
+          .where((message) => !message.isWelcome)
+          .map((message) => message.toMap())
+          .toList();
+      if (history.isEmpty) {
+        await preferences.remove(_historyKey);
+      } else {
+        await preferences.setString(_historyKey, jsonEncode(history));
+      }
+    } catch (error) {
+      debugPrint('Could not save local parish chat history: $error');
+    }
+  }
+
+  void _scrollToLatest() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  Future<void> _confirmClearChat() async {
+    final shouldClear = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Clear conversation?'),
+        content: const Text(
+          'This will permanently remove your chat history from this device.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Clear Chat'),
+          ),
+        ],
       ),
     );
+    if (shouldClear != true || !mounted) return;
+
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.remove(_historyKey);
+    if (!mounted) return;
+    setState(() {
+      _messages
+        ..clear()
+        ..add(ChatMessage(text: _welcomeText, isUser: false, isWelcome: true));
+    });
+    _scrollToLatest();
   }
 
   bool _detectTagalogLanguage(String text) {
@@ -256,14 +378,16 @@ class _AIChatScreenState extends State<AIChatScreen> {
 
   Future<void> _sendMessage() async {
     final messageText = _messageController.text.trim();
-    if (messageText.isEmpty || _isLoading) return;
+    if (messageText.isEmpty || _isLoading || _isHistoryLoading) return;
 
     setState(() {
       _messages.add(ChatMessage(text: messageText, isUser: true));
       _isLoading = true;
     });
+    _scrollToLatest();
 
     _messageController.clear();
+    await _saveChatHistory();
 
     try {
       final detectedTagalog = _detectTagalogLanguage(messageText);
@@ -274,10 +398,11 @@ class _AIChatScreenState extends State<AIChatScreen> {
       }
 
       final List<Map<String, String>> conversationHistory = [];
-      for (int i = 1; i < _messages.length; i++) {
+      for (final message in _messages) {
+        if (message.isWelcome) continue;
         conversationHistory.add({
-          'role': _messages[i].isUser ? 'user' : 'assistant',
-          'content': _messages[i].text,
+          'role': message.isUser ? 'user' : 'assistant',
+          'content': message.text,
         });
       }
 
@@ -286,20 +411,30 @@ class _AIChatScreenState extends State<AIChatScreen> {
         history: conversationHistory,
       );
 
+      final reply = ChatMessage(text: aiReply, isUser: false);
       if (mounted) {
         setState(() {
-          _messages.add(ChatMessage(text: aiReply, isUser: false));
+          _messages.add(reply);
         });
+        _scrollToLatest();
+      } else {
+        _messages.add(reply);
       }
+      await _saveChatHistory();
     } catch (error) {
       final errText = _currentLanguageIsTagalog
           ? 'Hindi makakonekta sa AI assistant ngayon. Subukan muli mamaya.'
           : 'The AI assistant is not available right now. Please try again later.';
+      final reply = ChatMessage(text: errText, isUser: false);
       if (mounted) {
         setState(() {
-          _messages.add(ChatMessage(text: errText, isUser: false));
+          _messages.add(reply);
         });
+        _scrollToLatest();
+      } else {
+        _messages.add(reply);
       }
+      await _saveChatHistory();
     } finally {
       if (mounted) {
         setState(() {
@@ -311,11 +446,10 @@ class _AIChatScreenState extends State<AIChatScreen> {
 
   List<String> _getSuggestedPrompts() {
     return [
-      'What sacraments and services can I book?',
-      'How to book baptism?',
-      'When is mass?',
-      'Where is the church?',
-      'How to donate?',
+      'What are the baptism requirements?',
+      'What are the parish fees?',
+      "What are today's schedules?",
+      'How can I book a sacrament?',
     ];
   }
 
@@ -326,9 +460,141 @@ class _AIChatScreenState extends State<AIChatScreen> {
     _sendMessage();
   }
 
+  String _formatTime(DateTime dateTime) {
+    final hour = dateTime.hour % 12 == 0 ? 12 : dateTime.hour % 12;
+    final minute = dateTime.minute.toString().padLeft(2, '0');
+    final period = dateTime.hour < 12 ? 'AM' : 'PM';
+    return '$hour:$minute $period';
+  }
+
+  List<InlineSpan> _formatLine(String line, TextStyle baseStyle) {
+    final normalizedLine = RegExp(r'^\s*[-*]\s+').hasMatch(line)
+        ? line.replaceFirst(RegExp(r'^\s*[-*]\s+'), '• ')
+        : line;
+    final spans = <InlineSpan>[];
+    final pattern = RegExp(r'\*\*(.+?)\*\*|\*(.+?)\*');
+    var start = 0;
+    for (final match in pattern.allMatches(normalizedLine)) {
+      if (match.start > start) {
+        spans.add(TextSpan(text: normalizedLine.substring(start, match.start)));
+      }
+      final text = match.group(1) ?? match.group(2) ?? '';
+      spans.add(
+        TextSpan(
+          text: text,
+          style: match.group(1) != null
+              ? baseStyle.copyWith(fontWeight: FontWeight.w700)
+              : baseStyle.copyWith(fontStyle: FontStyle.italic),
+        ),
+      );
+      start = match.end;
+    }
+    if (start < normalizedLine.length) {
+      spans.add(TextSpan(text: normalizedLine.substring(start)));
+    }
+    return spans;
+  }
+
+  Widget _buildFormattedMessage(String text, TextStyle style) {
+    final lines = text.split('\n');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (var index = 0; index < lines.length; index++)
+          if (lines[index].trim().isEmpty)
+            const SizedBox(height: 7)
+          else
+            Padding(
+              padding: EdgeInsets.only(
+                bottom: index == lines.length - 1 ? 0 : 3,
+              ),
+              child: Text.rich(
+                TextSpan(children: _formatLine(lines[index], style)),
+                style: style,
+              ),
+            ),
+      ],
+    );
+  }
+
+  Widget _buildMessage(ChatMessage message) {
+    final foreground = message.isUser ? Colors.white : ParishColors.textBlue900;
+    final baseStyle = TextStyle(color: foreground, fontSize: 14, height: 1.4);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        mainAxisAlignment: message.isUser
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
+        children: [
+          if (!message.isUser) ...[
+            const CircleAvatar(
+              radius: 15,
+              backgroundColor: ParishColors.primaryBlue,
+              child: Icon(
+                Icons.chat_bubble,
+                size: 17,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
+          Flexible(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: MediaQuery.sizeOf(context).width * 0.72,
+              ),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: message.isUser
+                      ? ParishColors.primaryBlue
+                      : ParishColors.bgBlue50,
+                  borderRadius: BorderRadius.only(
+                    topLeft: const Radius.circular(16),
+                    topRight: const Radius.circular(16),
+                    bottomLeft: Radius.circular(message.isUser ? 16 : 4),
+                    bottomRight: Radius.circular(message.isUser ? 4 : 16),
+                  ),
+                  border: message.isUser
+                      ? null
+                      : Border.all(color: ParishColors.borderBlue100),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 11,
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _buildFormattedMessage(message.text, baseStyle),
+                      const SizedBox(height: 5),
+                      Align(
+                        alignment: Alignment.bottomRight,
+                        child: Text(
+                          _formatTime(message.createdAt),
+                          style: TextStyle(
+                            color: foreground.withValues(alpha: 0.72),
+                            fontSize: 10,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _messageController.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 
@@ -336,45 +602,110 @@ class _AIChatScreenState extends State<AIChatScreen> {
   Widget build(BuildContext context) {
     return Column(
       children: [
+        Container(
+          padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
+          decoration: const BoxDecoration(
+            color: ParishColors.primaryBlue,
+            border: Border(
+              bottom: BorderSide(color: ParishColors.borderBlue200),
+            ),
+          ),
+          child: Row(
+            children: [
+              const CircleAvatar(
+                radius: 20,
+                backgroundColor: Colors.white,
+                child: Icon(
+                  Icons.chat_bubble,
+                  color: ParishColors.primaryBlue,
+                ),
+              ),
+              const SizedBox(width: 11),
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Parish AI Assistant',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      'Here to help',
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              PopupMenuButton<String>(
+                tooltip: 'Chat options',
+                enabled: !_isHistoryLoading,
+                iconColor: Colors.white,
+                onSelected: (value) {
+                  if (value == 'clear') _confirmClearChat();
+                },
+                itemBuilder: (context) => const [
+                  PopupMenuItem(
+                    value: 'clear',
+                    child: Row(
+                      children: [
+                        Icon(Icons.delete_outline),
+                        SizedBox(width: 10),
+                        Text('Clear Chat'),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              IconButton(
+                tooltip: 'Close chat',
+                onPressed: () => Navigator.of(context).maybePop(),
+                icon: const Icon(Icons.close, color: Colors.white),
+              ),
+            ],
+          ),
+        ),
         // Chat messages
         Expanded(
           child: ListView.builder(
+            controller: _scrollController,
             padding: const EdgeInsets.all(16.0),
-            itemCount: _messages.length,
+            itemCount: _messages.length + (_isLoading ? 1 : 0),
             itemBuilder: (context, index) {
+              if (index == _messages.length) {
+                return const Padding(
+                  padding: EdgeInsets.only(left: 38, bottom: 12),
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      SizedBox(width: 9),
+                      Text(
+                        'Parish AI Assistant is typing...',
+                        style: TextStyle(
+                          color: ParishColors.textGray600,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
               final message = _messages[index];
-              return Align(
-                alignment: message.isUser
-                    ? Alignment.centerRight
-                    : Alignment.centerLeft,
-                child: Container(
-                  margin: const EdgeInsets.only(bottom: 12.0),
-                  padding: const EdgeInsets.all(12.0),
-                  decoration: BoxDecoration(
-                    color: message.isUser
-                        ? ParishColors.primaryBlue
-                        : ParishColors.bgBlue50,
-                    borderRadius: BorderRadius.circular(16.0),
-                    border: message.isUser
-                        ? null
-                        : Border.all(color: ParishColors.borderBlue100),
-                  ),
-                  child: Text(
-                    message.text,
-                    style: TextStyle(
-                      color: message.isUser
-                          ? Colors.white
-                          : ParishColors.textBlue900,
-                      fontSize: 14,
-                    ),
-                  ),
-                ),
-              );
+              return _buildMessage(message);
             },
           ),
         ),
         // Suggested prompts
-        if (_messages.length <= 1) // Only show when chat is mostly empty
+        if (_messages.every((message) => message.isWelcome) &&
+            !_isHistoryLoading)
           Container(
             padding: const EdgeInsets.symmetric(
               horizontal: 16.0,
@@ -383,15 +714,6 @@ class _AIChatScreenState extends State<AIChatScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  'Suggestions:',
-                  style: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.bold,
-                    color: ParishColors.textBlue900,
-                  ),
-                ),
-                const SizedBox(height: 8),
                 Wrap(
                   spacing: 8,
                   runSpacing: 8,
@@ -416,7 +738,7 @@ class _AIChatScreenState extends State<AIChatScreen> {
           ),
         // Input area
         Container(
-          padding: const EdgeInsets.all(16.0),
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
           decoration: BoxDecoration(
             color: Colors.white,
             border: const Border(
@@ -428,10 +750,21 @@ class _AIChatScreenState extends State<AIChatScreen> {
               Expanded(
                 child: TextField(
                   controller: _messageController,
+                  minLines: 1,
+                  maxLines: 4,
+                  textInputAction: TextInputAction.send,
+                  enabled: !_isHistoryLoading,
+                  onChanged: (_) => setState(() {}),
                   decoration: InputDecoration(
-                    hintText: 'Type your message... (or type Tagalog)',
+                    hintText: 'Ask about parish services...',
                     hintStyle: const TextStyle(color: ParishColors.textGray600),
+                    filled: true,
+                    fillColor: ParishColors.bgGray50,
                     border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16.0),
+                      borderSide: BorderSide.none,
+                    ),
+                    enabledBorder: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(16.0),
                       borderSide: const BorderSide(
                         color: ParishColors.borderBlue100,
@@ -446,19 +779,20 @@ class _AIChatScreenState extends State<AIChatScreen> {
                 ),
               ),
               const SizedBox(width: 12.0),
-              FloatingActionButton(
-                onPressed: _sendMessage,
-                backgroundColor: ParishColors.primaryBlue,
-                child: _isLoading
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(
-                          color: Colors.white,
-                          strokeWidth: 2,
-                        ),
-                      )
-                    : const Icon(Icons.send, color: Colors.white),
+              IconButton.filled(
+                onPressed:
+                    _messageController.text.trim().isEmpty ||
+                        _isLoading ||
+                        _isHistoryLoading
+                    ? null
+                    : _sendMessage,
+                tooltip: 'Send message',
+                style: IconButton.styleFrom(
+                  backgroundColor: ParishColors.primaryBlue,
+                  disabledBackgroundColor: ParishColors.borderBlue100,
+                  minimumSize: const Size(48, 48),
+                ),
+                icon: const Icon(Icons.send_rounded),
               ),
             ],
           ),

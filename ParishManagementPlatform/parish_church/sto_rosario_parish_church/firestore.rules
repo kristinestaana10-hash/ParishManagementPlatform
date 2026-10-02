@@ -298,8 +298,15 @@ service cloud.firestore {
       allow create: if false;
       allow update: if isSignedIn() && isAdmin() &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'status', 'updatedAt', 'adminNotes'
-        ]) && request.resource.data.status in ['Request Sent', 'Processing', 'Completed'];
+          'status', 'updatedAt', 'adminNotes', 'softCopyUrl'
+        ]) && request.resource.data.status in [
+          'Request Sent', 'Processing', 'Completed',
+          'Ready to Pick Up', 'Ready for Pickup', 'Ready to Pickup'
+        ] &&
+        (!request.resource.data.keys().hasAny(['softCopyUrl']) ||
+          (request.resource.data.softCopyUrl is string &&
+            request.resource.data.softCopyUrl.size() <= 2048 &&
+            request.resource.data.softCopyUrl.matches('https://.*')));
       allow delete: if false;
     }
 

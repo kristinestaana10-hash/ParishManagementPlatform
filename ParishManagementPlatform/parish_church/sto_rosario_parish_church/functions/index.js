@@ -2049,13 +2049,25 @@ exports.getMyCertificateRequests = onCall(
     const available = new Set([...certificateDocs, ...legacyRecords.docs]
       .map((doc) => normalizeCertificateType(doc.data().certificateType || doc.data().type)));
     const latestRequests = new Map();
+    const latestSoftCopies = new Map();
     for (const doc of requests.docs) {
       const data = doc.data();
-      const type = String(data.certificateType || '').toLowerCase();
+      const type = normalizeCertificateType(data.certificateType || data.type);
+      if (!Object.prototype.hasOwnProperty.call(CERTIFICATE_TYPES, type)) continue;
       const current = latestRequests.get(type);
       const timestamp = data.requestDate?.toMillis?.() || 0;
       if (!current || timestamp >= current.timestamp) {
-        latestRequests.set(type, { timestamp, status: data.status, requestDate: data.requestDate?.toDate?.().toISOString() || null });
+        latestRequests.set(type, {
+          timestamp,
+          status: data.status,
+          requestDate: data.requestDate?.toDate?.().toISOString() || null,
+        });
+      }
+      const softCopyUrl = typeof data.softCopyUrl === 'string' ? data.softCopyUrl.trim() : '';
+      const currentSoftCopy = latestSoftCopies.get(type);
+      if (softCopyUrl.startsWith('https://') &&
+          (!currentSoftCopy || timestamp >= currentSoftCopy.timestamp)) {
+        latestSoftCopies.set(type, { timestamp, url: softCopyUrl, requestId: doc.id });
       }
     }
     return {
@@ -2063,9 +2075,112 @@ exports.getMyCertificateRequests = onCall(
         certificateType: type,
         available: available.has(type),
         ...(latestRequests.has(type) ? latestRequests.get(type) : {}),
+        softCopyUrl: latestSoftCopies.get(type)?.url || null,
+        softCopyRequestId: latestSoftCopies.get(type)?.requestId || null,
       })),
     };
   }
+);
+
+// Stream an attached certificate only after verifying the authenticated owner.
+// Proxying avoids browser CORS failures from Google Cloud Storage signed URLs
+// and never accepts a file URL or storage path from the client.
+exports.viewMyCertificateSoftCopy = onRequest(
+  { region: 'asia-southeast1', cors: true },
+  async (req, res) => {
+    if (req.method !== 'GET') {
+      res.set('Allow', 'GET').status(405).send('Method not allowed.');
+      return;
+    }
+    const authorization = String(req.headers.authorization || '');
+    const match = authorization.match(/^Bearer (.+)$/i);
+    if (!match) {
+      res.status(401).send('Authentication required.');
+      return;
+    }
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(match[1]);
+    } catch (_) {
+      res.status(401).send('Authentication required.');
+      return;
+    }
+
+    const requestId = String(req.query.requestId || '').trim();
+    if (!requestId || requestId.length > 150 || requestId.includes('/')) {
+      res.status(400).send('Invalid certificate request.');
+      return;
+    }
+    const requestDoc = await admin.firestore().collection('certificate_requests').doc(requestId).get();
+    if (!requestDoc.exists || requestDoc.data().userId !== decoded.uid) {
+      res.status(404).send('Certificate not found.');
+      return;
+    }
+    const softCopyUrl = requestDoc.data().softCopyUrl;
+    if (typeof softCopyUrl !== 'string' || !softCopyUrl.trim()) {
+      res.status(404).send('Certificate file not found.');
+      return;
+    }
+
+    let objectPath;
+    try {
+      const source = new URL(softCopyUrl);
+      const bucketName = admin.storage().bucket().name;
+      if (source.hostname === 'storage.googleapis.com') {
+        const pathParts = source.pathname.split('/').filter(Boolean);
+        if (pathParts.shift() !== bucketName) throw new Error('Unexpected bucket.');
+        objectPath = decodeURIComponent(pathParts.join('/'));
+      } else if (source.hostname === 'firebasestorage.googleapis.com') {
+        const storagePath = source.pathname.match(/^\/v0\/b\/([^/]+)\/o\/(.+)$/);
+        if (!storagePath || decodeURIComponent(storagePath[1]) !== bucketName) {
+          throw new Error('Unexpected bucket.');
+        }
+        objectPath = decodeURIComponent(storagePath[2]);
+      } else {
+        throw new Error('Unexpected storage host.');
+      }
+      // The storage subfolder may use a parish record ID instead of the Auth
+      // UID. Ownership is enforced by the request document above; keep the
+      // object constrained to the certificate upload area.
+      if (!objectPath.startsWith('certificate-requests/')) {
+        throw new Error('Unexpected certificate path.');
+      }
+    } catch (_) {
+      res.status(400).send('Invalid certificate file location.');
+      return;
+    }
+
+    try {
+      const storageFile = admin.storage().bucket().file(objectPath);
+      const [metadata] = await storageFile.getMetadata();
+      const contentType = String(metadata.contentType || '').toLowerCase();
+      if (!contentType.startsWith('image/') && contentType !== 'application/pdf') {
+        res.status(415).send('Unsupported certificate file format.');
+        return;
+      }
+      res.set('Content-Type', contentType);
+      res.set('Cache-Control', 'private, no-store, max-age=0');
+      res.set('X-Content-Type-Options', 'nosniff');
+      const stream = storageFile.createReadStream();
+      stream.on('error', (error) => {
+        console.error('Certificate storage stream failed', {
+          requestId,
+          uid: decoded.uid,
+          message: error?.message,
+        });
+        if (!res.headersSent) res.status(404).send('Certificate file not found.');
+        else res.end();
+      });
+      stream.pipe(res);
+    } catch (error) {
+      console.error('viewMyCertificateSoftCopy failed', {
+        requestId,
+        uid: decoded.uid,
+        message: error?.message,
+      });
+      if (!res.headersSent) res.status(502).send('Unable to retrieve the certificate file.');
+    }
+  },
 );
 
 exports.submitCertificateRequest = onCall(
@@ -2112,7 +2227,7 @@ async function sendCertificateStatusEmail(data, requestId, status) {
   const { smtpUser, fromName, transporter } = certificateMailer();
   const type = CERTIFICATE_TYPES[data.certificateType] || data.certificateName || 'Church Certificate';
   const date = data.requestDate?.toDate?.().toLocaleDateString('en-PH') || 'Not available';
-  const nextSteps = status === 'Completed'
+  const nextSteps = ['Completed', 'Ready to Pick Up', 'Ready for Pickup', 'Ready to Pickup'].includes(status)
     ? 'Your certificate request is ready. Please contact or visit the parish office to arrange release according to the parish procedure.'
     : status === 'Processing'
       ? 'The parish secretary is processing your request. Please monitor your request status for updates.'
@@ -2146,7 +2261,8 @@ exports.notifyCertificateRequestStatusChanged = onDocumentUpdated(
     const before = event.data?.before?.data() || {};
     const afterSnap = event.data?.after;
     const after = afterSnap?.data() || {};
-    if (!afterSnap || before.status === after.status || !['Processing', 'Completed'].includes(after.status)) return;
+    if (!afterSnap || before.status === after.status ||
+        !['Processing', 'Completed', 'Ready to Pick Up', 'Ready for Pickup', 'Ready to Pickup'].includes(after.status)) return;
     const marker = `${after.status.toLowerCase()}EmailSentAt`;
     if (after.notifications?.[marker]) return;
     try {
@@ -2885,39 +3001,58 @@ function detectAssistantIntent(text) {
   return Array.from(intents);
 }
 
-function parishServiceListAnswer(message, language) {
+async function parishServiceListAnswer(message, language, db) {
   const lower = String(message || '').toLowerCase();
   const asksForList = /(what|which|list|ano|alin|anu-ano|anong).{0,50}(sacrament|service|serbisyo|sakramento)|(sacrament|service|serbisyo|sakramento).{0,50}(offer|available|book|list|ino-offer|maaari|pwede|puwede)/i.test(lower);
   if (!asksForList) return '';
 
-  const services = language === 'tagalog'
-    ? [
-      '• Binyag',
-      '• Kumpil',
-      '• Kasal',
-      '• Misa para sa Yumao',
-      '• Basbas ng Bahay',
-      '• Pagpapahid sa May Sakit',
-      '• Intensyon ng Misa',
-      '• Unang Komunyon',
-    ].join('\n')
-    : [
-      '• Baptism',
-      '• Confirmation',
-      '• Wedding',
-      '• Funeral Mass',
-      '• House Blessing',
-      '• Anointing of the Sick',
-      '• Mass Intention',
-      '• First Communion',
-    ].join('\n');
-  return language === 'tagalog'
-    ? `Narito ang mga serbisyong maaaring i-book sa Sto. Rosario Parish app:\n${services}\n\nPara magpatuloy, pumili ng serbisyo sa Home screen upang makita ang mga detalye at booking form.`
-    : `Here are the services available to book through the Sto. Rosario Parish app:\n${services}\n\nTo get started, select a service on the Home screen to view its details and booking form.`;
-}
+  let activeForms;
+  try {
+    const snapshot = await db.collection('booking_forms').limit(50).get();
+    activeForms = snapshot.docs.filter((doc) => {
+      const data = doc.data() || {};
+      return data.active === true || String(data.status || '').trim().toLowerCase() === 'active';
+    });
+  } catch (error) {
+    console.warn('askParishAssistant: booking form list read failed', error?.message);
+    return '';
+  }
 
+  const knownNames = {
+    baptism: ['Baptism', 'Binyag'],
+    confirmation: ['Confirmation', 'Kumpil'],
+    wedding: ['Wedding', 'Kasal'],
+    funeral: ['Funeral Mass', 'Misa para sa Yumao'],
+    house_blessing: ['House Blessing', 'Basbas ng Bahay'],
+    anointing: ['Anointing of the Sick', 'Pagpapahid sa May Sakit'],
+    mass_intention: ['Mass Intention', 'Intensyon ng Misa'],
+    first_communion: ['First Communion', 'Unang Komunyon'],
+  };
+  const services = activeForms.map((doc) => {
+    const data = doc.data() || {};
+    const names = data.displayNames && typeof data.displayNames === 'object' ? data.displayNames : {};
+    const canonical = canonicalSacramentType(data.sacramentTypeKey || doc.id);
+    const known = knownNames[canonical];
+    const name = language === 'tagalog'
+      ? names.tagalog || known?.[1] || data.formName || data.name || data.title
+      : names.english || known?.[0] || data.formName || data.name || data.title;
+    return name ? `- ${String(name).trim()}` : '';
+  }).filter(Boolean);
+
+  if (!services.length) {
+    return language === 'tagalog'
+      ? 'Walang kasalukuyang aktibong sacrament o service booking form sa parish app.'
+      : 'There are no currently active sacrament or service booking forms in the parish app.';
+  }
+  const serviceList = services.join('\n');
+  return language === 'tagalog'
+    ? `Narito ang mga sacrament at service na kasalukuyang maaaring i-book:\n${serviceList}\n\nPumili ng serbisyo sa Home screen upang makita ang booking form.`
+    : `These sacraments and services are currently available to book:\n${serviceList}\n\nSelect a service on the Home screen to view its booking form.`;
+}
 function formatAssistantReply(reply) {
-  const lines = String(reply || '').split(/\r?\n/);
+  const lines = String(reply || '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\\\|/g, '|'));
   const formatted = [];
   const cellsFor = (line) => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
 
@@ -2959,8 +3094,18 @@ function formatAssistantReply(reply) {
   return formatted.join('\n')
     .replace(/\*\*(.*?)\*\*/g, '$1')
     .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/:\s*\[\s*(?:publicData|userData)\b[^\]]*\]/gi, '')
+    .replace(/\[\s*(?:publicData|userData)\b[^\]]*\]/gi, '')
+    .replace(/\\?\|/g, ' — ')
+    .replace(/^\s*—\s*/gm, '')
+    .replace(/[ \t]+([,.;!?])/g, '$1')
+    .replace(/[ \t]{2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+function hasInternalAssistantPath(reply) {
+  return /\[\s*(?:publicData|userData)\b[^\]]*\]/i.test(String(reply || ''));
 }
 
 const SERVICE_FACT_COLLECTIONS = [
@@ -3528,7 +3673,7 @@ exports.askParishAssistant = onCall(
 
     const db = admin.firestore();
 
-    const serviceListAnswer = parishServiceListAnswer(message, language);
+    const serviceListAnswer = await parishServiceListAnswer(message, language, db);
     if (serviceListAnswer) {
       return {
         reply: serviceListAnswer,
@@ -3567,51 +3712,71 @@ Authenticated user: ${request.auth?.uid ? 'yes' : 'no'}
 Whitelisted real-time database context:
 ${JSON.stringify({ publicData, userData }, null, 2)}
 
-Answer in a formal, courteous, easy-to-understand way for a first-time parishioner. Start with a direct answer, then explain the relevant next step in plain language when useful. Use short paragraphs and simple bullet points for lists. Do not use tables, pipe characters, or dense blocks of text. Explain app navigation in familiar terms such as “Home screen.” Avoid unexplained technical or church-specific terms. Cite only facts found in the supplied database context. Never answer from general knowledge or from the conversation history. If the context does not contain the requested fact, use the prescribed unavailable-information response. Do not mention implementation details, APIs, JSON, Firestore, or database internals unless the user asks technical support staff questions.`;
+Answer in a formal, courteous, easy-to-understand way for a first-time parishioner. Start with a direct answer, then explain the relevant next step in plain language when useful. Use short paragraphs and simple bullet points for lists. Do not use tables, pipe characters, or dense blocks of text. Explain app navigation in familiar terms such as “Home screen.” Avoid unexplained technical or church-specific terms. Cite only facts found in the supplied database context. Never answer from general knowledge or from the conversation history. If the context does not contain the requested fact, use the prescribed unavailable-information response. Do not mention implementation details, APIs, JSON, Firestore, database internals, or internal data paths such as bracketed publicData/userData field references unless the user asks technical support staff questions.`;
 
     const apiKey = (GROQ_API_KEY.value() || process.env.GROQ_API_KEY || '').trim();
     if (!apiKey) {
       throw new HttpsError('failed-precondition', 'AI service is not configured. Please set the GROQ_API_KEY secret.');
     }
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: GROQ_CHAT_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: message },
-        ],
-        temperature: 0.2,
-        stream: false,
-      }),
-      timeout: 20000,
-    });
-
-    const bodyText = await response.text();
-    if (!response.ok) {
-      console.error('askParishAssistant: Groq error', {
-        status: response.status,
-        body: bodyText.slice(0, 500),
+    const requestCompletion = async (prompt) => {
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: GROQ_CHAT_MODEL,
+          messages: [
+            { role: 'system', content: prompt },
+            { role: 'user', content: message },
+          ],
+          temperature: 0.2,
+          stream: false,
+        }),
+        timeout: 20000,
       });
-      throw new HttpsError('unavailable', 'The AI service is temporarily unavailable. Please try again later.');
-    }
 
-    let body;
-    try {
-      body = JSON.parse(bodyText);
-    } catch (err) {
-      console.error('askParishAssistant: invalid Groq JSON', err?.message);
-      throw new HttpsError('internal', 'The AI service returned an invalid response.');
-    }
+      const bodyText = await response.text();
+      if (!response.ok) {
+        console.error('askParishAssistant: Groq error', {
+          status: response.status,
+          body: bodyText.slice(0, 500),
+        });
+        throw new HttpsError('unavailable', 'The AI service is temporarily unavailable. Please try again later.');
+      }
 
-    const reply = formatAssistantReply(body?.choices?.[0]?.message?.content || '');
+      let body;
+      try {
+        body = JSON.parse(bodyText);
+      } catch (err) {
+        console.error('askParishAssistant: invalid Groq JSON', err?.message);
+        throw new HttpsError('internal', 'The AI service returned an invalid response.');
+      }
+
+      return body?.choices?.[0]?.message?.content || '';
+    };
+
+    let rawReply = await requestCompletion(systemPrompt);
+    let reply = formatAssistantReply(rawReply);
+    if (hasInternalAssistantPath(rawReply)) {
+      try {
+        rawReply = await requestCompletion(`${systemPrompt}
+
+Rewrite requirement: Answer the parishioner's question directly using the actual values in the supplied parish context. Do not output internal field names, variable names, or bracketed data paths. If a requested value is present, state that value in clear, formal language.`);
+        reply = formatAssistantReply(rawReply);
+      } catch (error) {
+        console.warn('askParishAssistant: could not regenerate a user-facing reply', error?.message);
+      }
+    }
     if (!reply) {
-      throw new HttpsError('internal', 'The AI service returned an empty response.');
+      return {
+        reply: parishInformationUnavailableReply(language),
+        intents,
+        usedRealtimeData: true,
+        answeredFromDatabase: true,
+      };
     }
 
     return {

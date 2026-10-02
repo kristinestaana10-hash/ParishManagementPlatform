@@ -273,7 +273,8 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
       floatingActionButton: FloatingActionButton(
         onPressed: _showAIChat,
         backgroundColor: ParishColors.primaryBlue,
-        tooltip: _isLanguageTagalog ? 'Parish Assistant' : 'Parish Assistant',
+        elevation: 5,
+        tooltip: 'Open Parish AI Assistant',
         child: const Icon(Icons.chat_bubble, color: Colors.white),
       ),
       bottomNavigationBar: isMobile
@@ -721,7 +722,7 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
                         separatorBuilder: (_, __) => const Divider(height: 1),
                         itemBuilder: (context, index) {
                           final notification = _notifications[index];
-                          final createdAt = notification['createdAt'] as DateTime;
+                            final createdAt = notification['createdAt'] as DateTime;
                           final now = DateTime.now();
                           final diff = now.difference(createdAt);
 
@@ -819,56 +820,29 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
       context: context,
       barrierDismissible: true,
       builder: (context) => Dialog(
-        insetPadding: const EdgeInsets.all(16),
+        insetPadding: const EdgeInsets.all(12),
         backgroundColor: Colors.transparent,
-        child: Container(
-          width: double.maxFinite,
-          height: MediaQuery.of(context).size.height * 0.8,
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: Column(
-            children: [
-              // Header
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: ParishColors.primaryBlue,
-                  borderRadius: const BorderRadius.only(
-                    topLeft: Radius.circular(20),
-                    topRight: Radius.circular(20),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final media = MediaQuery.of(context);
+            final availableHeight =
+                media.size.height - media.viewInsets.bottom - 24;
+            final chatHeight = availableHeight.clamp(240.0, 720.0);
+            return ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: SizedBox(
+                width: double.maxFinite,
+                height: chatHeight,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(18),
+                  child: Material(
+                    color: Colors.white,
+                    child: AIChatScreen(isTagalog: _isLanguageTagalog),
                   ),
                 ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.chat_bubble,
-                      color: Colors.white,
-                      size: 24,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        _t('Parish Assistant', 'Parish Assistant'),
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: () => Navigator.pop(context),
-                      icon: const Icon(Icons.close, color: Colors.white),
-                    ),
-                  ],
-                ),
               ),
-              // Chat content
-              Expanded(child: AIChatScreen(isTagalog: _isLanguageTagalog)),
-            ],
-          ),
+            );
+          },
         ),
       ),
     );
@@ -1173,4 +1147,3 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
     );
   }
 }
-

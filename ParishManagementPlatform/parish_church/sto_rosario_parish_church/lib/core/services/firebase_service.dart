@@ -14,6 +14,7 @@ import 'scheduling_conflict_service.dart';
 class FirebaseService {
   FirebaseService._();
   static final FirebaseService instance = FirebaseService._();
+  static final Map<String, Map<String, dynamic>> _bookingFormCache = {};
 
   final FirebaseAuth auth = FirebaseAuth.instance;
   final FirebaseFirestore firestore = FirebaseFirestore.instance;
@@ -433,6 +434,38 @@ class FirebaseService {
       rethrow;
     }
 
+    return structuredId;
+  }
+
+  /// Record that a booking requirement is fulfilled by the parish's existing
+  /// certificate, without copying the file into a second storage location.
+  Future<String> saveParishCertificateRequirement({
+    required String sacramentType,
+    required String requirementType,
+    required String certificateRequestId,
+    required String certificateUrl,
+    required String certificateName,
+  }) async {
+    final currentUser = auth.currentUser;
+    if (currentUser == null) {
+      throw Exception('User must be signed in to link a parish certificate');
+    }
+    final structuredId = await generateStructuredId('requirement');
+    await firestore.collection('requirements').doc(structuredId).set({
+      'structuredId': structuredId,
+      'userId': currentUser.uid,
+      'userName': currentUser.displayName ?? 'User',
+      'userEmail': currentUser.email ?? '',
+      'sacramentType': sacramentType,
+      'requirementType': requirementType,
+      'documentUrl': certificateUrl,
+      'documentName': certificateName,
+      'status': 'approved',
+      'validationResult': null,
+      'source': 'certificate_request',
+      'sourceCertificateRequestId': certificateRequestId,
+      'uploadedAt': FieldValue.serverTimestamp(),
+    });
     return structuredId;
   }
 
@@ -1256,8 +1289,8 @@ class FirebaseService {
   }
 
   /// Returns only requested form keys that have a `booking_requirements`
-  /// record. This is intended for listing cards on the home page and uses one
-  /// bounded collection read instead of issuing many queries for every card.
+  /// record. Use small indexed query batches to avoid waiting for a full
+  /// collection scan before the home page can show cards.
   Future<Set<String>> getAvailableBookingFormKeys(
     Iterable<String> formKeys,
   ) async {
@@ -1267,46 +1300,93 @@ class FirebaseService {
         .toSet();
     if (requestedKeys.isEmpty) return <String>{};
 
-    final records = await Future.wait(
-      const ['booking_requirements'].map((collectionName) async {
-        try {
-          return await firestore
-              .collection(collectionName)
-              .limit(100)
-              .get()
-              .timeout(const Duration(seconds: 10));
-        } catch (error) {
-          debugPrint('Failed to load $collectionName form list: $error');
-          return null;
-        }
-      }),
-    );
+    final requestedNames = requestedKeys
+        .expand((key) => _bookingFormDisplayNames(key))
+        .toSet()
+        .toList(growable: false);
+    final queryBatches = <List<String>>[];
+    for (var i = 0; i < requestedNames.length; i += 10) {
+      queryBatches.add(
+        requestedNames.skip(i).take(10).toList(growable: false),
+      );
+    }
+    final snapshots = await Future.wait(queryBatches.map((batch) async {
+      try {
+        return await firestore
+            .collection('booking_requirements')
+            .where('sacramentType', whereIn: batch)
+            .get()
+            .timeout(const Duration(seconds: 4));
+      } catch (error) {
+        debugPrint('Failed to load booking form batch: $error');
+        return null;
+      }
+    }));
 
     final availableKeys = <String>{};
     for (final key in requestedKeys) {
-      for (final snapshot in records) {
+      for (final snapshot in snapshots) {
         if (snapshot == null) continue;
-        final matchesForm = snapshot.docs.any((form) {
+        final matchingForms = snapshot.docs.where((form) {
           final data = form.data();
-          final candidates = <Object?>[
-            form.id,
-            data['formKey'],
-            data['sacramentTypeKey'],
-            data['bookingType'],
-            data['sacramentType'],
-            data['serviceType'],
-            data['name'],
-            data['title'],
-            data['formName'],
-          ];
-          return candidates.any(
-            (value) => _bookingFormKeysMatch(value?.toString() ?? '', key),
+          return _bookingFormKeysMatch(
+            (data['sacramentType'] ?? '').toString(),
+            key,
           );
-        });
-        if (matchesForm) {
+        }).toList(growable: false);
+        if (matchingForms.isNotEmpty) {
+          var describedForm = matchingForms.first;
+          for (final form in matchingForms) {
+            if ((form.data()['description'] ?? '')
+                .toString()
+                .trim()
+                .isNotEmpty) {
+              describedForm = form;
+              break;
+            }
+          }
+          _bookingFormCache[_normalizeBookingFormKey(key)] =
+              describedForm.data();
           availableKeys.add(key);
           break;
         }
+      }
+    }
+
+    // Keep compatibility with older records whose booking type is stored in
+    // another field. Only do the collection read when the indexed lookup did
+    // not find any forms, so normal home loads stay on the fast path.
+    if (availableKeys.isEmpty) {
+      try {
+        final legacyForms = await firestore
+            .collection('booking_requirements')
+            .limit(100)
+            .get()
+            .timeout(const Duration(seconds: 4));
+        for (final key in requestedKeys) {
+          for (final form in legacyForms.docs) {
+            final data = form.data();
+            final candidates = <Object?>[
+              form.id,
+              data['formKey'],
+              data['sacramentTypeKey'],
+              data['bookingType'],
+              data['sacramentType'],
+              data['serviceType'],
+              data['name'],
+              data['title'],
+              data['formName'],
+            ];
+            if (candidates.any((value) =>
+                _bookingFormKeysMatch(value?.toString() ?? '', key))) {
+              _bookingFormCache[_normalizeBookingFormKey(key)] = data;
+              availableKeys.add(key);
+              break;
+            }
+          }
+        }
+      } catch (error) {
+        debugPrint('Legacy booking form lookup failed: $error');
       }
     }
     return availableKeys;
@@ -1335,6 +1415,36 @@ class FirebaseService {
   Future<Map<String, dynamic>?> getBookingFormDefinition(String formKey) async {
     final key = formKey.trim();
     if (key.isEmpty) return null;
+    final cached = _bookingFormCache[_normalizeBookingFormKey(key)];
+    if (cached != null) return cached;
+
+    // Most current booking_requirements records use generated document IDs
+    // and identify the sacrament/service in `sacramentType`. Resolve this in
+    // one indexed query instead of trying every possible field first.
+    try {
+      final snapshot = await firestore
+          .collection('booking_requirements')
+          .where('sacramentType', isEqualTo: _bookingFormDisplayName(key))
+          .limit(10)
+          .get();
+      if (snapshot.docs.isNotEmpty) {
+        var matchingDoc = snapshot.docs.first;
+        for (final form in snapshot.docs) {
+          if ((form.data()['description'] ?? '')
+              .toString()
+              .trim()
+              .isNotEmpty) {
+            matchingDoc = form;
+            break;
+          }
+        }
+        final data = matchingDoc.data();
+        _bookingFormCache[_normalizeBookingFormKey(key)] = data;
+        return data;
+      }
+    } catch (error) {
+      debugPrint('Fast booking requirement lookup failed for $key: $error');
+    }
 
     try {
       for (final collectionName in const [
@@ -1344,7 +1454,8 @@ class FirebaseService {
         try {
           final collection = firestore.collection(collectionName);
           final doc = await collection.doc(key).get();
-          if (doc.exists) return doc.data();
+          final directMatch = doc.exists ? doc.data() : null;
+          final displayName = _bookingFormDisplayName(key);
 
           for (final field in const [
             'formKey',
@@ -1356,17 +1467,33 @@ class FirebaseService {
             'title',
             'formName',
           ]) {
-            final snapshot = await collection
-                .where(field, isEqualTo: key)
-                .limit(1)
-                .get();
-            if (snapshot.docs.isNotEmpty) return snapshot.docs.first.data();
+            for (final lookupValue in {key, displayName}) {
+              final snapshot = await collection
+                  .where(field, isEqualTo: lookupValue)
+                  .limit(10)
+                  .get();
+              if (snapshot.docs.isNotEmpty) {
+                Map<String, dynamic>? describedRecord;
+                for (final form in snapshot.docs) {
+                  final data = form.data();
+                  if ((data['description'] ?? '')
+                      .toString()
+                      .trim()
+                      .isNotEmpty) {
+                    describedRecord = data;
+                    break;
+                  }
+                }
+                return describedRecord ?? snapshot.docs.first.data();
+              }
+            }
           }
 
           // Older parish data may use a display name as its document ID or
           // store the key in a differently named field. Read the collection
           // and match normalized values so those records remain usable.
-          final allForms = await collection.limit(100).get();
+          final allForms = await collection.limit(500).get();
+          Map<String, dynamic>? matchingRecord;
           for (final form in allForms.docs) {
             final data = form.data();
             final candidates = <Object?>[
@@ -1382,9 +1509,14 @@ class FirebaseService {
             ];
             if (candidates.any((value) =>
                 _bookingFormKeysMatch(value?.toString() ?? '', key))) {
-              return data;
+              if ((data['description'] ?? '').toString().trim().isNotEmpty) {
+                return data;
+              }
+              matchingRecord ??= data;
             }
           }
+          if (matchingRecord != null) return matchingRecord;
+          if (directMatch != null) return directMatch;
         } catch (e) {
           debugPrint('Failed to check $collectionName/$key: $e');
         }
@@ -1417,7 +1549,7 @@ class FirebaseService {
     const aliases = <String, List<String>>{
       'baptism': ['binyag'],
       'confirmation': ['kumpil'],
-      'wedding': ['kasal', 'matrimony'],
+      'wedding': ['kasal', 'matrimony', 'holymatrimony'],
       'funeral': ['funeralmass', 'misaparasayumao'],
       'houseblessing': ['basbasngbahay'],
       'anointing': ['anointingofthesick', 'pagpapahidsamaysakit'],
@@ -1426,6 +1558,34 @@ class FirebaseService {
     };
     return aliases[requested]?.map(normalize).contains(candidateKey) ?? false;
   }
+
+  List<String> _bookingFormDisplayNames(String key) {
+    final normalized = _normalizeBookingFormKey(key);
+    const displayNameAliases = <String, List<String>>{
+      'baptism': ['Baptism', 'Binyag'],
+      'confirmation': ['Confirmation', 'Kumpil'],
+      'wedding': ['Wedding', 'Holy Matrimony', 'Kasal'],
+      'funeral': ['Funeral', 'Funeral Mass', 'Misa para sa Yumao'],
+      'houseblessing': ['House Blessing', 'Basbas ng Bahay'],
+      'anointing': [
+        'Anointing',
+        'Anointing of the Sick',
+        'Pagpapahid sa May Sakit',
+      ],
+      'massintention': ['Mass Intention', 'Intensyon ng Misa'],
+      'firstcommunion': ['First Communion', 'Unang Komunyon'],
+    };
+    return displayNameAliases[normalized] ?? [_bookingFormDisplayName(key)];
+  }
+
+  String _bookingFormDisplayName(String key) => key
+      .split(RegExp(r'[_\s-]+'))
+      .where((part) => part.isNotEmpty)
+      .map((part) => '${part[0].toUpperCase()}${part.substring(1)}')
+      .join(' ');
+
+  String _normalizeBookingFormKey(String key) =>
+      key.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
 
   Future<String> askParishAssistant({
     required String message,

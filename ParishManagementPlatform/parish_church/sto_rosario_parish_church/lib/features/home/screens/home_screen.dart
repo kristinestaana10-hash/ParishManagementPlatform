@@ -61,22 +61,27 @@ class _HomeScreenState extends State<HomeScreen> {
   /// The service batches this into two collection reads, avoiding a separate
   /// database query for every sacrament card.
   Future<void> _loadAvailableBookingForms() async {
-    final availableKeys = await FirebaseService.instance
-        .getAvailableBookingFormKeys(
-          SacramentType.values.map((type) => type.bookingFormKey),
-        );
+    try {
+      final availableKeys = await FirebaseService.instance
+          .getAvailableBookingFormKeys(
+            SacramentType.values.map((type) => type.bookingFormKey),
+          );
 
-    if (!mounted) return;
-    setState(() {
-      _availableBookingForms
-        ..clear()
-        ..addAll(
-          SacramentType.values.where(
-            (type) => availableKeys.contains(type.bookingFormKey),
-          ),
-        );
-      _bookingFormsLoading = false;
-    });
+      if (!mounted) return;
+      setState(() {
+        _availableBookingForms
+          ..clear()
+          ..addAll(
+            SacramentType.values.where(
+              (type) => availableKeys.contains(type.bookingFormKey),
+            ),
+          );
+      });
+    } catch (error) {
+      debugPrint('Failed to load sacrament and service cards: $error');
+    } finally {
+      if (mounted) setState(() => _bookingFormsLoading = false);
+    }
   }
 
   bool _hasBookingForm(SacramentType type) =>

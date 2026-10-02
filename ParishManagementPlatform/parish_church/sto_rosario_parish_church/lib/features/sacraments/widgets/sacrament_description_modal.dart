@@ -51,6 +51,10 @@ class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
     final descriptions = data['descriptions'] is Map
         ? Map<String, dynamic>.from(data['descriptions'] as Map)
         : const <String, dynamic>{};
+    final description = data['description'];
+    final localizedDescription = description is Map
+        ? Map<String, dynamic>.from(description)
+        : const <String, dynamic>{};
     final reminders = data['reminders'] is Map
         ? Map<String, dynamic>.from(data['reminders'] as Map)
         : const <String, dynamic>{};
@@ -65,9 +69,17 @@ class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
 
     setState(() {
       _databaseDescriptionEnglish =
-          (descriptions['english'] ?? data['descriptionEnglish'])?.toString();
+          (descriptions['english'] ??
+                  localizedDescription['english'] ??
+                  data['descriptionEnglish'] ??
+                  (description is String ? description : null))
+              ?.toString();
       _databaseDescriptionTagalog =
-          (descriptions['tagalog'] ?? data['descriptionTagalog'])?.toString();
+          (descriptions['tagalog'] ??
+                  localizedDescription['tagalog'] ??
+                  data['descriptionTagalog'] ??
+                  (description is String ? description : null))
+              ?.toString();
       _databaseReminderEnglish = parseList(reminders['english']);
       _databaseReminderTagalog = parseList(reminders['tagalog']);
     });
@@ -400,7 +412,7 @@ class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
     if (databaseText != null && databaseText.trim().isNotEmpty) {
       return databaseText.trim();
     }
-    return widget.sacramentType.fullDescription(widget.isTagalog);
+    return '';
   }
 
   LinearGradient _getGradient(SacramentType type) {
@@ -426,12 +438,10 @@ class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
 
   Widget _buildRemindersSection(BuildContext context) {
     final isMobile = ParishBreakpoints.isMobile(context);
-
-    // No reminders for house blessing, anointing, mass intention, and first communion
-    if (widget.sacramentType == SacramentType.houseBlessing ||
-        widget.sacramentType == SacramentType.anointing ||
-        widget.sacramentType == SacramentType.massIntention ||
-        widget.sacramentType == SacramentType.firstCommunion) {
+    final databaseReminders = widget.isTagalog
+        ? _databaseReminderTagalog
+        : _databaseReminderEnglish;
+    if (databaseReminders.isEmpty) {
       return const SizedBox.shrink();
     }
 
@@ -466,19 +476,9 @@ class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
             ],
           ),
           SizedBox(height: isMobile ? 8 : 12),
-          _buildReminderItem(
-            widget.isTagalog
-                ? 'Mangyaring mag-upload ng lahat ng valid na dokumento.'
-                : 'Please upload all valid documents.',
-            context,
+          ...databaseReminders.map(
+            (reminder) => _buildReminderItem(reminder, context),
           ),
-          _buildReminderItem(
-            widget.isTagalog
-                ? 'Ang mga larawan ay dapat malinaw, nababasa, at de-kalidad (hindi blurred o cropped).'
-                : 'Uploaded images must be clear, readable, and in good quality (not blurred or cropped).',
-            context,
-          ),
-          ..._getSpecificReminders(context),
         ],
       ),
     );
@@ -516,116 +516,4 @@ class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
     );
   }
 
-  List<Widget> _getSpecificReminders(BuildContext context) {
-    final reminders = <Widget>[];
-    final databaseReminders = widget.isTagalog
-        ? _databaseReminderTagalog
-        : _databaseReminderEnglish;
-
-    if (databaseReminders.isNotEmpty) {
-      return databaseReminders
-          .map((reminder) => _buildReminderItem(reminder, context))
-          .toList(growable: false);
-    }
-
-    switch (widget.sacramentType) {
-      case SacramentType.baptism:
-        reminders.add(
-          _buildReminderItem(
-            widget.isTagalog
-                ? 'Bayad sa Binyag - Weekdays: ₱1,650 (kasama ang damit ng bata at kandila) | Sunday pagkatapos ng Misa: ₱300'
-                : 'Baptism Fee - Weekdays: ₱1,650 (includes cloths for child and candle) | Sunday after Mass: ₱300',
-            context,
-          ),
-        );
-        reminders.add(
-          _buildImportantReminder(
-            widget.isTagalog
-                ? 'Kung ang mga magulang ay wala pa sa 18 taong gulang, hindi makakapag-book online. Kailangan nilang makipag-ugnayan sa parish office.'
-                : 'If parents are below 18 years old, booking cannot proceed online. They must personally coordinate with the parish office.',
-            context,
-          ),
-        );
-        break;
-
-      case SacramentType.confirmation:
-        reminders.add(
-          _buildReminderItem(
-            widget.isTagalog
-                ? 'Mangyaring i-upload ang mga kinakailangang dokumento at iba pang valid files.'
-                : 'Please upload required documents and other valid files.',
-            context,
-          ),
-        );
-        reminders.add(
-          _buildReminderItem(
-            widget.isTagalog
-                ? 'Siguraduhing kumpleto at malinaw ang lahat ng submitted files.'
-                : 'Ensure all submitted files are complete and clear.',
-            context,
-          ),
-        );
-        break;
-
-      case SacramentType.wedding:
-        reminders.add(
-          _buildImportantReminder(
-            widget.isTagalog
-                ? 'Kung ang ikakasal (bride o groom) ay wala pa sa 18 taong gulang, hindi maaaring mag-book ng kasal.'
-                : 'If either the bride or groom is below 18 years old, the wedding is not allowed.',
-            context,
-          ),
-        );
-        reminders.add(
-          _buildImportantReminder(
-            widget.isTagalog
-                ? 'Kung ang ikakasal ay 18 hanggang 20 taong gulang, kinakailangan ng parental guidance/consent. Kailangan nilang makipag-ugnayan sa parish office bago mag-proceed.'
-                : 'If the couple is 18 to 20 years old, they must have parental guidance/consent. They are required to coordinate directly with the parish office before proceeding.',
-            context,
-          ),
-        );
-        break;
-
-      default:
-        break;
-    }
-
-    return reminders;
-  }
-
-  Widget _buildImportantReminder(String text, BuildContext context) {
-    final isMobile = ParishBreakpoints.isMobile(context);
-
-    return Container(
-      margin: EdgeInsets.only(top: 4, bottom: isMobile ? 6 : 8),
-      padding: EdgeInsets.all(isMobile ? 10 : 12),
-      decoration: BoxDecoration(
-        color: Colors.red.shade50,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.red.shade200),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(
-            Icons.warning_amber_rounded,
-            color: Colors.red.shade700,
-            size: isMobile ? 18 : 20,
-          ),
-          SizedBox(width: isMobile ? 6 : 8),
-          Expanded(
-            child: Text(
-              text,
-              style: TextStyle(
-                fontSize: isMobile ? 13 : 14,
-                height: 1.4,
-                color: Colors.red.shade700,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 }
