@@ -107,6 +107,11 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
   _bookingsSubscription;
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>?
   _donationDrivesSubscription;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>?
+  _announcementsSubscription;
+  List<QueryDocumentSnapshot<Map<String, dynamic>>> _driveDocs = [];
+  List<QueryDocumentSnapshot<Map<String, dynamic>>> _announcementDocs = [];
+  List<QueryDocumentSnapshot<Map<String, dynamic>>> _bookingDocs = [];
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
   @override
@@ -117,106 +122,174 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
       _bookingsSubscription = FirebaseService.instance
           .userBookingsStream()
           .listen((snapshot) {
-            setState(() {
-              _bookingsCount = snapshot.docs.length;
-            });
+            _bookingDocs = snapshot.docs;
+            _bookingsCount = snapshot.docs.length;
+            _rebuildNotifications();
           });
     }
   }
 
   void _loadNotifications() {
-    // Listen to donation drives
     _donationDrivesSubscription = FirebaseFirestore.instance
         .collection('donation_drives')
-        .orderBy('createdAt', descending: true)
-        .limit(10)
         .snapshots()
         .listen((snapshot) {
-      _updateNotifications();
+      _driveDocs = snapshot.docs;
+      _rebuildNotifications();
+    });
+    _announcementsSubscription = FirebaseFirestore.instance
+        .collection('announcements')
+        .snapshots()
+        .listen((snapshot) {
+      _announcementDocs = snapshot.docs;
+      _rebuildNotifications();
     });
   }
 
-  void _updateNotifications() {
+  DateTime _notificationDate(Map<String, dynamic> data) {
+    for (final key in ['updatedAt', 'submittedAt', 'createdAt']) {
+      final value = data[key];
+      if (value is Timestamp) return value.toDate();
+      if (value is DateTime) return value;
+    }
+    return DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  bool _isRecent(DateTime date, DateTime now) {
+    final age = now.difference(date);
+    return !date.isBefore(DateTime.fromMillisecondsSinceEpoch(1)) &&
+        age >= Duration.zero &&
+        age <= const Duration(days: 7);
+  }
+
+  bool _isApprovedAnnouncement(Map<String, dynamic> data) {
+    if (data['active'] == false || data['isActive'] == false) return false;
+    return [
+      data['approvalStatus'],
+      data['approval_status'],
+      data['approvalstatus'],
+      data['status'],
+    ].any((value) => value?.toString().trim().toLowerCase() == 'approved');
+  }
+
+  void _rebuildNotifications() {
+    if (!mounted) return;
     _notifications.clear();
+    final now = DateTime.now();
 
-    // Fetch recent donation drives (last 7 days)
-    FirebaseFirestore.instance
-        .collection('donation_drives')
-        .orderBy('createdAt', descending: true)
-        .limit(10)
-        .get()
-        .then((driveSnapshot) {
-      final now = DateTime.now();
-      for (var doc in driveSnapshot.docs) {
-        final data = doc.data();
-        final createdAt = (data['createdAt'] is Timestamp)
-            ? (data['createdAt'] as Timestamp).toDate()
-            : DateTime.now();
-
-        // Include drives from last 7 days
-        if (now.difference(createdAt).inDays <= 7) {
-          _notifications.add({
-            'type': 'donation_drive',
-            'id': doc.id,
-            'title': data['title'] ?? 'Donation Drive',
-            'description': data['description'] ?? '',
-            'createdAt': createdAt,
-            'icon': Icons.volunteer_activism,
-            'color': ParishColors.primaryGold,
-          });
-        }
+    for (final doc in _driveDocs) {
+      final data = doc.data();
+      final status = (data['status'] ?? '').toString().trim().toLowerCase();
+      final date = _notificationDate(data);
+      if (!const {'active', 'open', 'ongoing', 'published'}.contains(status) ||
+          !_isRecent(date, now)) {
+        continue;
       }
+      _notifications.add({
+        'type': 'donation_drive',
+        'id': doc.id,
+        'title': (data['title'] ?? '').toString().trim().isEmpty
+            ? _t('Bagong Donation Drive', 'New Donation Drive')
+            : data['title'].toString(),
+        'description': (data['description'] ?? '').toString().trim().isEmpty
+            ? _t('Bukas na ang donation drive.', 'A donation drive is now open.')
+            : data['description'].toString(),
+        'createdAt': date,
+        'icon': Icons.volunteer_activism,
+        'color': ParishColors.primaryGold,
+      });
+    }
 
-      // Fetch user's recent bookings with status changes
-      if (!_isGuest) {
-        FirebaseService.instance.userBookingsStream().first.then((bookingSnapshot) {
-          final now = DateTime.now();
-          for (var doc in bookingSnapshot.docs) {
-            final data = doc.data();
-            final bookingDate = (data['createdAt'] is Timestamp)
-                ? (data['createdAt'] as Timestamp).toDate()
-                : DateTime.now();
+    for (final doc in _announcementDocs) {
+      final data = doc.data();
+      final date = _notificationDate(data);
+      if (!_isApprovedAnnouncement(data) || !_isRecent(date, now)) continue;
+      final title = (data['title'] ?? '').toString().trim();
+      final body = (data['body'] ?? data['content'] ?? '').toString().trim();
+      _notifications.add({
+        'type': 'announcement',
+        'id': doc.id,
+        'title': title.isEmpty
+            ? _t('Anunsyo ng Parokya', 'Parish Announcement')
+            : title,
+        'description': body.isEmpty
+            ? _t(
+                'May bagong anunsyo mula sa parokya.',
+                'There is a new announcement from the parish.',
+              )
+            : body,
+        'createdAt': date,
+        'icon': Icons.campaign,
+        'color': ParishColors.primaryBlue,
+      });
+    }
 
-            // Include recent bookings (last 7 days)
-            if (now.difference(bookingDate).inDays <= 7) {
-              final status = data['status'] ?? 'pending';
-              _notifications.add({
-                'type': 'booking',
-                'id': doc.id,
-                'title': _t('Booking Update', 'Booking Update'),
-                'description':
-                    '${data['sacrament'] ?? 'Sacrament'} - ${_t(_getStatusTagalog(status), status)}',
-                'createdAt': bookingDate,
-                'icon': Icons.check_circle,
-                'color': status == 'confirmed'
-                    ? ParishColors.greenSuccess
-                    : ParishColors.primaryBlue,
-              });
-            }
-          }
+    for (final doc in _bookingDocs) {
+      final data = doc.data();
+      final date = _notificationDate(data);
+      if (!_isRecent(date, now)) continue;
+      final rawStatus = (data['status'] ?? 'pending').toString();
+      final status = rawStatus.trim().toLowerCase();
+      final bookingType =
+          (data['sacramentType'] ?? data['sacrament'] ?? 'Booking').toString();
+      _notifications.add({
+        'type': 'booking',
+        'id': doc.id,
+        'title': _bookingNotificationTitle(status),
+        'description': '$bookingType — ${_getStatusTagalog(status)}',
+        'createdAt': date,
+        'icon': _bookingNotificationIcon(status),
+        'color': _bookingNotificationColor(status),
+      });
+    }
 
-          setState(() {
-            _notificationCount = _notifications.length;
-          });
-        });
-      } else {
-        setState(() {
-          _notificationCount = _notifications.length;
-        });
-      }
-    });
+    _notifications.sort((a, b) =>
+        (b['createdAt'] as DateTime).compareTo(a['createdAt'] as DateTime));
+    setState(() => _notificationCount = _notifications.length);
   }
+
+  String _bookingNotificationTitle(String status) => switch (status) {
+    'pending' => _t('Natanggap ang booking', 'Booking received'),
+    'approved' || 'accepted' || 'confirmed' =>
+      _t('Naaprubahan ang booking', 'Booking approved'),
+    'rejected' => _t('Tinanggihan ang booking', 'Booking rejected'),
+    'cancelled' => _t('Kinansela ang booking', 'Booking cancelled'),
+    'completed' => _t('Nakumpleto ang booking', 'Booking completed'),
+    'paid' => _t('Bayad na ang booking', 'Booking payment received'),
+    _ => _t('Update sa booking', 'Booking update'),
+  };
+
+  IconData _bookingNotificationIcon(String status) => switch (status) {
+    'approved' || 'accepted' || 'confirmed' || 'completed' || 'paid' =>
+      Icons.check_circle,
+    'rejected' || 'cancelled' => Icons.cancel,
+    _ => Icons.event_note,
+  };
+
+  Color _bookingNotificationColor(String status) => switch (status) {
+    'approved' || 'accepted' || 'confirmed' || 'completed' || 'paid' =>
+      ParishColors.greenSuccess,
+    'rejected' || 'cancelled' => Colors.red,
+    _ => ParishColors.primaryBlue,
+  };
 
   String _getStatusTagalog(String status) {
     switch (status.toLowerCase()) {
       case 'confirmed':
-        return 'Nakumpirma';
+        return _t('Nakumpirma', 'Confirmed');
+      case 'approved':
+      case 'accepted':
+        return _t('Naaprubahan', 'Approved');
+      case 'rejected':
+        return _t('Tinanggihan', 'Rejected');
+      case 'paid':
+        return _t('Bayad na', 'Paid');
       case 'pending':
-        return 'Naghihintay';
+        return _t('Naghihintay', 'Pending');
       case 'cancelled':
-        return 'Kinansela';
+        return _t('Kinansela', 'Cancelled');
       case 'completed':
-        return 'Tapos na';
+        return _t('Tapos na', 'Completed');
       default:
         return status;
     }
@@ -226,6 +299,7 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
   void dispose() {
     _bookingsSubscription?.cancel();
     _donationDrivesSubscription?.cancel();
+    _announcementsSubscription?.cancel();
     super.dispose();
   }
 
@@ -746,63 +820,68 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
                             );
                           }
 
-                          return Padding(
-                            padding: const EdgeInsets.symmetric(
-                              vertical: 12,
-                              horizontal: 8,
-                            ),
-                            child: Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Container(
-                                  width: 50,
-                                  height: 50,
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    color: (notification['color'] as Color)
-                                        .withValues(alpha: 0.2),
+                          return InkWell(
+                            borderRadius: BorderRadius.circular(12),
+                            onTap: () => _openNotification(notification),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                vertical: 12,
+                                horizontal: 8,
+                              ),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Container(
+                                    width: 50,
+                                    height: 50,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      color: (notification['color'] as Color)
+                                          .withValues(alpha: 0.2),
+                                    ),
+                                    child: Icon(
+                                      notification['icon'] as IconData,
+                                      color: notification['color'] as Color,
+                                      size: 24,
+                                    ),
                                   ),
-                                  child: Icon(
-                                    notification['icon'] as IconData,
-                                    color: notification['color'] as Color,
-                                    size: 24,
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          notification['title'] as String,
+                                          style: const TextStyle(
+                                            fontSize: 16,
+                                            fontWeight: FontWeight.bold,
+                                            color: ParishColors.textBlue900,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          notification['description'] as String,
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: 14,
+                                            color: Colors.grey[600],
+                                          ),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          timeAgo,
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: Colors.grey[400],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
                                   ),
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        notification['title'] as String,
-                                        style: const TextStyle(
-                                          fontSize: 16,
-                                          fontWeight: FontWeight.bold,
-                                          color: ParishColors.textBlue900,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        notification['description'] as String,
-                                        maxLines: 2,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontSize: 14,
-                                          color: Colors.grey[600],
-                                        ),
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        timeAgo,
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: Colors.grey[400],
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
                           );
                         },
@@ -813,6 +892,25 @@ class _ParishionerDashboardState extends State<ParishionerDashboard> {
         ),
       ),
     );
+  }
+
+  void _openNotification(Map<String, dynamic> notification) {
+    final type = notification['type']?.toString();
+    Navigator.of(context).pop();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      switch (type) {
+        case 'booking':
+          _onNavTap(_isGuest ? 0 : 2);
+          break;
+        case 'announcement':
+          _navigateToAnnouncements();
+          break;
+        case 'donation_drive':
+          _navigateToDonationDrives();
+          break;
+      }
+    });
   }
 
   void _showAIChat() {

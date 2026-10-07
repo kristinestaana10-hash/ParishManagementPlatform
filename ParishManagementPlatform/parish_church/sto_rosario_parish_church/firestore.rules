@@ -11,7 +11,7 @@ service cloud.firestore {
         request.auth.token.admin == true ||
         request.auth.token.role == 'admin'
       );
-    }
+    }s
 
     function isOpenDonationDrive(driveId, donationType) {
       let drivePath = /databases/$(database)/documents/donation_drives/$(driveId);
@@ -425,6 +425,38 @@ service cloud.firestore {
       allow read, update: if isSignedIn() && isAdmin();
     }
 
+    // Private tracking records. Clients can append only events for their own
+    // authenticated account; no client, including the owner, can read them.
+    match /audit_logs_app/{auditId} {
+      allow create: if isSignedIn() &&
+        request.resource.data.keys().hasAll([
+          'userId', 'userName', 'userEmail', 'action', 'targetType',
+          'details', 'createdAt'
+        ]) &&
+        request.resource.data.keys().hasOnly([
+          'userId', 'userName', 'userEmail', 'action', 'targetType',
+          'targetId', 'details', 'createdAt'
+        ]) &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.userName is string &&
+        request.resource.data.userEmail is string &&
+        request.resource.data.details is map &&
+        request.resource.data.createdAt == request.time &&
+        request.resource.data.action in [
+          'user_logged_in', 'user_logged_out',
+          'booking_submitted', 'requirement_submitted',
+          'donation_submitted', 'mass_offering_submitted',
+          'drive_donation_submitted', 'profile_updated',
+          'certificate_request_submitted', 'transaction_status_updated'
+        ] &&
+        request.resource.data.targetType in [
+          'account', 'booking', 'requirement', 'donation',
+          'mass_offering', 'donation_drive_submission',
+          'certificate_request'
+        ];
+      allow read, update, delete: if false;
+    }
+
     // Parish profile collection for church information
     match /parish_profile/{profileId} {
       allow read: if true; // Public read access for parish information
@@ -442,6 +474,12 @@ service cloud.firestore {
     // Legacy source for existing form definitions. This can be removed after
     // all documents have been migrated to booking_requirements.
     match /booking_forms/{formId} {
+      allow read: if true;
+      allow create, update, delete: if isSignedIn() && isAdmin();
+    }
+
+    // Fee options are shown to parishioners before they submit a booking.
+    match /service_fees/{feeId} {
       allow read: if true;
       allow create, update, delete: if isSignedIn() && isAdmin();
     }

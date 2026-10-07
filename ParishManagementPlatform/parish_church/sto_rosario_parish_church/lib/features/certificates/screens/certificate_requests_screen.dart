@@ -94,6 +94,69 @@ class _CertificateRequestsScreenState extends State<CertificateRequestsScreen> {
     return null;
   }
 
+  String _t(String tagalog, String english) =>
+      widget.isTagalog ? tagalog : english;
+
+  Future<void> _confirmCertificateRequest(String type) async {
+    var agreed = false;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(_t('Paalala Bago Humiling', 'Before You Request')),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                _t(
+                  'Bago magpatuloy, pakitandaan:',
+                  'Please keep these details in mind before continuing:',
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                _t(
+                  '• Maaaring may bayad sa paghingi ng sertipiko. Ang bayad ay ibibigay sa parish.\n\n• Kailangang kunin ang sertipiko sa parish.',
+                  '• A certificate request may require payment. The payment will be made at the parish.\n\n• The certificate must be claimed or picked up at the parish.',
+                ),
+              ),
+              const SizedBox(height: 12),
+              CheckboxListTile(
+                value: agreed,
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: Text(
+                  _t(
+                    'Nauunawaan ko at sumasang-ayon ako.',
+                    'I understand and agree.',
+                  ),
+                ),
+                onChanged: (value) => setDialogState(
+                  () => agreed = value ?? false,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: Text(_t('Kanselahin', 'Cancel')),
+            ),
+            FilledButton(
+              onPressed: agreed
+                  ? () => Navigator.of(dialogContext).pop(true)
+                  : null,
+              child: Text(_t('Magpatuloy', 'Continue')),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (confirmed == true && mounted) await _request(type);
+  }
+
   Future<void> _request(String type) async {
     setState(() => _submitting.add(type));
     try {
@@ -358,7 +421,7 @@ class _CertificateRequestsScreenState extends State<CertificateRequestsScreen> {
                   ),
                   onPressed: _submitting.contains(type)
                       ? null
-                      : () => _request(type),
+                      : () => _confirmCertificateRequest(type),
                   icon: _submitting.contains(type)
                       ? const SizedBox(
                           width: 17,

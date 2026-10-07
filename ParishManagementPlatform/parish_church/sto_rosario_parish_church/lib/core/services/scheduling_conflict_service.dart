@@ -54,25 +54,27 @@ class SchedulingConflictService {
         return SchedulingConflictResult.noConflict();
       }
 
-      // For restricted services, check against all approved bookings
-      if (!RestrictedServiceType.isRestricted(normalizedKey)) {
-        debugPrint(
-          'SchedulingConflictService: $normalizedKey is not a restricted service',
-        );
-        return SchedulingConflictResult.noConflict();
-      }
-
-      // Get all approved bookings from the database
+      // Check all scheduled services against the shared two-per-period cap.
       final bookings = await _getAllApprovedBookings();
       final requestedMinutes = time == null ? null : _parseTimeToMinutes(time);
       final requestedPeriod = requestedMinutes == null
           ? null
           : _schedulePeriod(requestedMinutes);
+      if (requestedMinutes == null || requestedPeriod == null) {
+        return SchedulingConflictResult.conflict(
+          bookingId: '',
+          sacramentType: sacramentType,
+          userName: 'System',
+          date: date,
+          time: time,
+          message: 'A valid date and time are required to verify availability.',
+        );
+      }
       debugPrint(
         'SchedulingConflictService: Found ${bookings.length} approved bookings total',
       );
 
-      // Check for conflicts with existing bookings
+      var periodBookingCount = 0;
       for (final booking in bookings) {
         debugPrint(
           'SchedulingConflictService: Checking booking - ID: ${booking.id}, Type: ${booking.sacramentType}, Date: ${booking.date}, Time: ${booking.time}, Status: ${booking.status}',
@@ -89,11 +91,7 @@ class SchedulingConflictService {
         final bookingTypeKey = booking.sacramentTypeKey.isNotEmpty
             ? booking.sacramentTypeKey
             : _normalizeSacramentType(booking.sacramentType);
-        if (!RestrictedServiceType.isRestricted(bookingTypeKey)) {
-          continue;
-        }
-
-        if (bookingTypeKey != normalizedKey) {
+        if (RestrictedServiceType.isMassIntention(bookingTypeKey)) {
           continue;
         }
 
@@ -105,7 +103,7 @@ class SchedulingConflictService {
           continue;
         }
 
-        if (time == null || time.trim().isEmpty || booking.time.isEmpty) {
+        if (time == null || time.trim().isEmpty) {
           return SchedulingConflictResult.conflict(
             bookingId: booking.id,
             sacramentType: booking.sacramentType,
@@ -117,36 +115,35 @@ class SchedulingConflictService {
           );
         }
 
+        if (booking.time.isEmpty) continue;
         final bookingMinutes = _parseTimeToMinutes(booking.time);
-        if (requestedMinutes == null || bookingMinutes == null) {
-          continue;
-        }
+        if (bookingMinutes == null) continue;
 
-        final minuteDifference = (requestedMinutes - bookingMinutes).abs();
-        if (minuteDifference < 60) {
+        if (requestedMinutes == bookingMinutes) {
           return SchedulingConflictResult.conflict(
             bookingId: booking.id,
             sacramentType: booking.sacramentType,
             userName: booking.userName ?? 'Another Parishioner',
             date: date,
             time: time,
-            message:
-                'The selected date and time overlaps with another approved booking. Please choose a time at least 1 hour apart.',
+            message: 'This exact time is already booked. Please choose another time.',
           );
         }
+        if (_schedulePeriod(bookingMinutes) == requestedPeriod) {
+          periodBookingCount++;
+        }
+      }
 
-        final bookingPeriod = _schedulePeriod(bookingMinutes);
-        if (requestedPeriod != null && requestedPeriod == bookingPeriod) {
-          return SchedulingConflictResult.conflict(
-            bookingId: booking.id,
-            sacramentType: booking.sacramentType,
-            userName: booking.userName ?? 'Another Parishioner',
-            date: date,
-            time: time,
-            message:
-                'Only 1 $sacramentType booking is allowed in the $requestedPeriod schedule for this date. Please choose another available schedule.',
-          );
-        }
+      if (periodBookingCount >= 2) {
+        return SchedulingConflictResult.conflict(
+          bookingId: '',
+          sacramentType: sacramentType,
+          userName: 'Another Parishioner',
+          date: date,
+          time: time,
+          message:
+              'The $requestedPeriod schedule is full for this date. Only two bookings are allowed in each period.',
+        );
       }
 
       debugPrint('SchedulingConflictService: No conflicts detected');
@@ -255,9 +252,15 @@ class SchedulingConflictService {
           )
           .get();
 
+      final oldSnapshot = await firestore
+          .collection('sacrament_requests')
+          .where('status', whereIn: _activeBookingStatuses)
+          .get();
       final bookings = <BookingRecord>[];
+      final seenBookingIds = <String>{};
 
-      for (final doc in snapshot.docs) {
+      for (final doc in [...snapshot.docs, ...oldSnapshot.docs]) {
+        if (!seenBookingIds.add(doc.id)) continue;
         try {
           final booking = BookingRecord.fromFirestore(doc.id, doc.data());
 
@@ -657,8 +660,14 @@ class SchedulingConflictService {
           .collection('bookings')
           .where('status', whereIn: _activeBookingStatuses)
           .get();
+      final oldSnapshot = await firestore
+          .collection('sacrament_requests')
+          .where('status', whereIn: _activeBookingStatuses)
+          .get();
 
-      return snapshot.docs
+      final seenBookingIds = <String>{};
+      return [...snapshot.docs, ...oldSnapshot.docs]
+          .where((doc) => seenBookingIds.add(doc.id))
           .map((doc) => BookingRecord.fromFirestore(doc.id, doc.data()))
           .where((booking) => booking.date == date)
           .toList();
@@ -726,14 +735,30 @@ class SchedulingConflictService {
   ) async {
     try {
       final bookings = await getBookingsForDate(date);
-      final bookedTimes = bookings
-          .map((b) => _timeSlotKey(b.time))
-          .where((t) => t.isNotEmpty)
+      final activeBookings = bookings.where((booking) {
+        final typeKey = booking.sacramentTypeKey.isNotEmpty
+            ? booking.sacramentTypeKey
+            : _normalizeSacramentType(booking.sacramentType);
+        return !RestrictedServiceType.isMassIntention(typeKey);
+      }).toList();
+      final bookedTimes = activeBookings
+          .map((booking) => _timeSlotKey(booking.time))
+          .where((time) => time.isNotEmpty)
           .toSet();
+      final periodCounts = {'AM': 0, 'PM': 0};
+      for (final booking in activeBookings) {
+        final minutes = _parseTimeToMinutes(booking.time);
+        if (minutes == null) continue;
+        final period = _schedulePeriod(minutes);
+        periodCounts[period] = periodCounts[period]! + 1;
+      }
 
-      return allPossibleTimeSlots
-          .where((slot) => !bookedTimes.contains(_timeSlotKey(slot)))
-          .toList();
+      return allPossibleTimeSlots.where((slot) {
+        if (bookedTimes.contains(_timeSlotKey(slot))) return false;
+        final minutes = _parseTimeToMinutes(slot);
+        if (minutes == null) return true;
+        return periodCounts[_schedulePeriod(minutes)]! < 2;
+      }).toList();
     } catch (e) {
       debugPrint(
         'SchedulingConflictService: Error getting available slots: $e',

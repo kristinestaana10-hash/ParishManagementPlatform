@@ -107,7 +107,20 @@ class DonationDrivesScreen extends StatelessWidget {
                           ),
                         );
                       }
-                      final drives = (snapshot.data?.docs ?? []).toList()
+                      final drives = (snapshot.data?.docs ?? [])
+                          .where((doc) {
+                            final status = (doc.data()['status'] ?? '')
+                                .toString()
+                                .trim()
+                                .toLowerCase();
+                            return const {
+                              'active',
+                              'open',
+                              'ongoing',
+                              'published',
+                            }.contains(status);
+                          })
+                          .toList()
                         ..sort(
                           (a, b) => _createdAt(
                             b.data(),
@@ -488,6 +501,8 @@ class _DonationDriveDetailScreenState extends State<DonationDriveDetailScreen> {
               donationType: 'monetary',
               description: 'Donation drive: ${widget.driveData['title'] ?? ''}',
               paymentReturnType: 'donationDrive',
+              driveId: widget.driveId,
+              driveTitle: widget.driveData['title']?.toString() ?? '',
             );
         final checkoutUrl = (result['checkoutUrl'] ?? '').toString();
         final checkoutUri = Uri.tryParse(checkoutUrl);
@@ -518,9 +533,7 @@ class _DonationDriveDetailScreenState extends State<DonationDriveDetailScreen> {
       } else {
         submission['details'] = _otherDetailsController.text.trim();
       }
-      await FirebaseFirestore.instance
-          .collection('donation_submissions')
-          .add(submission);
+      await FirebaseService.instance.submitDonationDriveCommitment(submission);
       if (!mounted) return;
       await _showModalNotification(
         t(

@@ -570,7 +570,43 @@ class BookingsScreen extends StatelessWidget {
     String sacramentType,
     bool isSundayBooking,
     Map<String, dynamic> fields,
+    {Map<String, dynamic>? booking}
   ) {
+    double? parseAmount(dynamic value) {
+      if (value is num) return value.toDouble();
+      if (value is String) {
+        return double.tryParse(value.replaceAll(RegExp(r'[^0-9.]'), ''));
+      }
+      return null;
+    }
+
+    final savedFeeBreakdown = booking?['feeBreakdown'];
+    if (savedFeeBreakdown is Map) {
+      final savedTotal = parseAmount(savedFeeBreakdown['total']);
+      if (savedTotal != null && savedTotal > 0) return savedTotal.round();
+    }
+
+    final savedDetails = booking?['details'];
+    if (savedDetails is Map) {
+      final details = Map<String, dynamic>.from(savedDetails);
+      final paymentOption = details['paymentOption'];
+      final baseAmount = paymentOption is Map
+          ? parseAmount(paymentOption['amount'])
+          : null;
+      final selectedAddons = details['selectedAddons'];
+      if (baseAmount != null && baseAmount > 0) {
+        var total = baseAmount;
+        if (selectedAddons is List) {
+          for (final addon in selectedAddons) {
+            if (addon is Map) {
+              total += parseAmount(addon['price'] ?? addon['amount']) ?? 0;
+            }
+          }
+        }
+        return total.round();
+      }
+    }
+
     final isBaptism = _isBaptismBooking(sacramentType, fields);
     if (isBaptism) {
       return _BookingFormFeeCache.instance.baptismAmount(
@@ -832,6 +868,7 @@ class BookingsScreen extends StatelessWidget {
       sacramentType,
       isSundayBooking,
       fields,
+      booking: booking,
     );
 
     final effectiveStatus = _resolveBookingEffectiveStatus(booking);
@@ -848,15 +885,23 @@ class BookingsScreen extends StatelessWidget {
       return;
     }
 
-    final feeBreakdown = {
-      'total': amount,
-      'currency': 'PHP',
-    };
+    final savedFeeBreakdown = booking['feeBreakdown'];
+    final feeBreakdown = savedFeeBreakdown is Map
+        ? Map<String, dynamic>.from(savedFeeBreakdown)
+        : <String, dynamic>{};
+    feeBreakdown['total'] = amount;
+    feeBreakdown['currency'] = feeBreakdown['currency'] ?? 'PHP';
 
     final bookingDetails = {
       'fields': fields,
       'additionalGodparents':
           details['additionalGodparents'] ?? <Map<String, dynamic>>[],
+      if (details['paymentOption'] != null)
+        'paymentOption': details['paymentOption'],
+      if (details['selectedAddons'] != null)
+        'selectedAddons': details['selectedAddons'],
+      if (details['totalAmount'] != null)
+        'totalAmount': details['totalAmount'],
     };
 
     try {
@@ -1187,6 +1232,13 @@ class BookingsScreen extends StatelessWidget {
   ) {
     final detailsMap = booking['details'] as Map<String, dynamic>? ?? {};
     final fields = detailsMap['fields'] as Map<String, dynamic>? ?? {};
+    final requiredDocuments = detailsMap['requiredDocuments'] is List
+        ? (detailsMap['requiredDocuments'] as List)
+              .whereType<Map>()
+              .map((item) => Map<String, dynamic>.from(item))
+              .toList(growable: false)
+        : const <Map<String, dynamic>>[];
+    final hasRequiredDocuments = requiredDocuments.isNotEmpty;
     final status = _resolveBookingEffectiveStatus(booking);
     final followUpNotes =
         booking['documentFollowUpNotes']?.toString().trim() ?? '';
@@ -1200,6 +1252,7 @@ class BookingsScreen extends StatelessWidget {
       sacramentType,
       isSundayBooking,
       fields,
+      booking: booking,
     );
     final additionalGodparents = detailsMap['additionalGodparents'] is List
         ? detailsMap['additionalGodparents'] as List<dynamic>
@@ -1229,6 +1282,7 @@ class BookingsScreen extends StatelessWidget {
     final hasDetailedInfo =
         bookingInfoItems.isNotEmpty ||
         groupedFields.values.any((items) => items.isNotEmpty) ||
+        hasRequiredDocuments ||
         followUpNotes.isNotEmpty ||
         assignedPriest.isNotEmpty ||
         adminNotes.isNotEmpty;
@@ -1326,6 +1380,29 @@ class BookingsScreen extends StatelessWidget {
                     : ListView(
                         padding: EdgeInsets.all(isMobile ? 12 : 16),
                         children: [
+                          if (hasRequiredDocuments)
+                            _buildBookingNoteSection(
+                              isTagalog
+                                  ? 'Mga Kinakailangang Dokumento'
+                                  : 'Required Documents',
+                              [
+                                'Reminder: Please submit all required documents, including their hardcopies, to the parish office at least one week before the scheduled sacrament. Uploading the documents through the app does not replace the submission of their hardcopies. All required hardcopy documents must still be submitted to the parish office.',
+                                ...requiredDocuments.map((document) {
+                                  final name = document['name']?.toString() ?? '';
+                                  final documentStatus = document['status']?.toString() ?? 'pending';
+                                  final dueDate = document['dueDate']?.toString();
+                                  final statusLabel = switch (documentStatus) {
+                                    'uploaded' => isTagalog ? 'Na-upload' : 'Uploaded',
+                                    'on_file' => isTagalog ? 'Nasa talaan ng parokya' : 'On parish record',
+                                    'to_follow' => isTagalog ? 'Ipapasa pa' : 'To Follow',
+                                    _ => isTagalog ? 'Hindi pa naipapasa' : 'Pending',
+                                  };
+                                  return '• $name — $statusLabel${dueDate == null ? '' : ' (due $dueDate)'}';
+                                }),
+
+                              ].join('\n'),
+                              isMobile,
+                            ),
                           if (followUpNotes.isNotEmpty)
                             _buildBookingNoteSection(
                               isTagalog

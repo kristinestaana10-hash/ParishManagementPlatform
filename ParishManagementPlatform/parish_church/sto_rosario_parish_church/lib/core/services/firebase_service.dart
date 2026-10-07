@@ -26,12 +26,34 @@ class FirebaseService {
   /// Upload profile image to Firebase Storage and return download URL
   Future<String?> uploadProfileImage(PlatformFile imageFile) async {
     final user = auth.currentUser;
-    if (user == null) return null;
+    if (user == null) {
+      throw FirebaseAuthException(
+        code: 'not-authenticated',
+        message: 'You must be signed in to upload a profile image.',
+      );
+    }
 
     try {
-      // Create a unique file path
+      final extension = (imageFile.extension ?? '').toLowerCase();
+      const contentTypes = <String, String>{
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'gif': 'image/gif',
+        'webp': 'image/webp',
+        'bmp': 'image/bmp',
+        'heic': 'image/heic',
+        'heif': 'image/heif',
+        'avif': 'image/avif',
+      };
+      final safeExtension = contentTypes.containsKey(extension)
+          ? extension
+          : 'jpg';
+      final contentType = contentTypes[safeExtension]!;
+
+      // The Storage rule requires each user's UID at the start of the name.
       final fileName =
-          'profile_${user.uid}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+          '${user.uid}.${DateTime.now().millisecondsSinceEpoch}.$safeExtension';
       final ref = storage.ref().child('profile_images/$fileName');
 
       UploadTask uploadTask;
@@ -41,14 +63,14 @@ class FirebaseService {
         // Web platform - use bytes
         uploadTask = ref.putData(
           imageFile.bytes!,
-          SettableMetadata(contentType: 'image/jpeg'),
+          SettableMetadata(contentType: contentType),
         );
       } else if (imageFile.path != null) {
         // Mobile/Desktop - use file path
         final file = io.File(imageFile.path!);
         uploadTask = ref.putFile(
           file,
-          SettableMetadata(contentType: 'image/jpeg'),
+          SettableMetadata(contentType: contentType),
         );
       } else {
         debugPrint('No bytes or path available for upload');
@@ -64,13 +86,46 @@ class FirebaseService {
       return downloadUrl;
     } catch (e) {
       debugPrint('Error uploading profile image: $e');
-      return null;
+      rethrow;
     }
   }
 
   String get currentUid => auth.currentUser?.uid ?? '';
   String get currentUserName => auth.currentUser?.displayName ?? 'Guest';
   String get currentUserEmail => auth.currentUser?.email ?? '';
+
+  Map<String, dynamic> _auditLogData(
+    User user, {
+    required String action,
+    required String targetType,
+    String? targetId,
+    Map<String, dynamic> details = const {},
+  }) => {
+    'userId': user.uid,
+    'userName': user.displayName ?? '',
+    'userEmail': user.email ?? '',
+    'action': action,
+    'targetType': targetType,
+    if (targetId != null) 'targetId': targetId,
+    'details': details,
+    'createdAt': FieldValue.serverTimestamp(),
+  };
+
+  Future<void> _recordAuditLog(
+    User user, {
+    required String action,
+    required String targetType,
+    String? targetId,
+    Map<String, dynamic> details = const {},
+  }) async {
+    await firestore.collection('audit_logs_app').add(_auditLogData(
+          user,
+          action: action,
+          targetType: targetType,
+          targetId: targetId,
+          details: details,
+        ));
+  }
 
   /// Generate a structured ID with auto-incrementing number
   /// Format: prefix_001, prefix_002, etc.
@@ -344,7 +399,24 @@ class FirebaseService {
       'lastUpdated': FieldValue.serverTimestamp(),
     };
 
-    await query.docs.first.reference.set(updateData, SetOptions(merge: true));
+    final batch = firestore.batch();
+    batch.set(query.docs.first.reference, updateData, SetOptions(merge: true));
+    batch.set(
+      firestore.collection('audit_logs_app').doc(),
+      _auditLogData(
+        user,
+        action: 'profile_updated',
+        targetType: 'account',
+        details: {
+          if (name != null) 'nameChanged': true,
+          if (phone != null) 'phoneChanged': true,
+          if (address != null) 'addressChanged': true,
+          if (barangay != null) 'barangayChanged': true,
+          if (profileImage != null) 'profileImageChanged': true,
+        },
+      ),
+    );
+    await batch.commit();
   }
 
   Stream<QuerySnapshot<Map<String, dynamic>>> getUserSacramentRequestsStream() {
@@ -424,10 +496,26 @@ class FirebaseService {
     );
 
     try {
-      await firestore
-          .collection('requirements')
-          .doc(structuredId)
-          .set(requirementData);
+      final batch = firestore.batch();
+      batch.set(
+        firestore.collection('requirements').doc(structuredId),
+        requirementData,
+      );
+      batch.set(
+        firestore.collection('audit_logs_app').doc(),
+        _auditLogData(
+          currentUser,
+          action: 'requirement_submitted',
+          targetType: 'requirement',
+          targetId: structuredId,
+          details: {
+            'sacramentType': sacramentType,
+            'requirementType': requirementType,
+            'bookingId': bookingId ?? '',
+          },
+        ),
+      );
+      await batch.commit();
       debugPrint('DEBUG: Successfully saved requirement to Firestore');
     } catch (e) {
       debugPrint('DEBUG: Error saving to Firestore: $e');
@@ -451,7 +539,9 @@ class FirebaseService {
       throw Exception('User must be signed in to link a parish certificate');
     }
     final structuredId = await generateStructuredId('requirement');
-    await firestore.collection('requirements').doc(structuredId).set({
+    final requirementRef = firestore.collection('requirements').doc(structuredId);
+    final batch = firestore.batch();
+    batch.set(requirementRef, {
       'structuredId': structuredId,
       'userId': currentUser.uid,
       'userName': currentUser.displayName ?? 'User',
@@ -466,6 +556,21 @@ class FirebaseService {
       'sourceCertificateRequestId': certificateRequestId,
       'uploadedAt': FieldValue.serverTimestamp(),
     });
+    batch.set(
+      firestore.collection('audit_logs_app').doc(),
+      _auditLogData(
+        currentUser,
+        action: 'requirement_submitted',
+        targetType: 'requirement',
+        targetId: structuredId,
+        details: {
+          'sacramentType': sacramentType,
+          'requirementType': requirementType,
+          'source': 'certificate_request',
+        },
+      ),
+    );
+    await batch.commit();
     return structuredId;
   }
 
@@ -594,6 +699,9 @@ class FirebaseService {
     final s = value.toLowerCase();
     if (s.contains('bapt') || s.contains('binyag')) return 'baptism';
     if (s.contains('confirm') || s.contains('kumpil')) return 'confirmation';
+    if (s.contains('renewal') && s.contains('vow')) {
+      return 'renewal_of_vows';
+    }
     if (s.contains('wedding') ||
         s.contains('kasal') ||
         s.contains('matrimony')) {
@@ -760,6 +868,18 @@ class FirebaseService {
       debugPrint('Failed to update user profile on login: $e\n$st');
     }
 
+    if (credential.user != null) {
+      try {
+        await _recordAuditLog(
+          credential.user!,
+          action: 'user_logged_in',
+          targetType: 'account',
+        );
+      } catch (e) {
+        debugPrint('Failed to record login audit log: $e');
+      }
+    }
+
     return credential;
   }
 
@@ -816,6 +936,18 @@ class FirebaseService {
       }
     } catch (e, st) {
       debugPrint('Failed to update user profile after OTP signup: $e\n$st');
+    }
+
+    if (credential.user != null) {
+      try {
+        await _recordAuditLog(
+          credential.user!,
+          action: 'user_logged_in',
+          targetType: 'account',
+        );
+      } catch (e) {
+        debugPrint('Failed to record signup login audit log: $e');
+      }
     }
 
     return credential;
@@ -920,11 +1052,31 @@ class FirebaseService {
       debugPrint('Failed to create user record after signup: $e\n$st');
     }
 
+    try {
+      await _recordAuditLog(
+        user,
+        action: 'user_logged_in',
+        targetType: 'account',
+      );
+    } catch (e) {
+      debugPrint('Failed to record signup login audit log: $e');
+    }
+
     return credential;
   }
 
   Future<void> signOut() async {
-    if (auth.currentUser != null) {
+    final user = auth.currentUser;
+    if (user != null) {
+      try {
+        await _recordAuditLog(
+          user,
+          action: 'user_logged_out',
+          targetType: 'account',
+        );
+      } catch (e) {
+        debugPrint('Failed to record logout audit log: $e');
+      }
       await auth.signOut();
     }
   }
@@ -1072,16 +1224,71 @@ class FirebaseService {
     }
 
     try {
-      await firestore
-          .collection('donations')
-          .doc(structuredId)
-          .set(donationData);
+      final collectionName = donationType == 'massOffering'
+          ? 'mass_offerings'
+          : 'donations';
+      final batch = firestore.batch();
+      batch.set(
+        firestore.collection(collectionName).doc(structuredId),
+        donationData,
+      );
+      if (currentUser != null) {
+        batch.set(
+          firestore.collection('audit_logs_app').doc(),
+          _auditLogData(
+            currentUser,
+            action: donationType == 'massOffering'
+                ? 'mass_offering_submitted'
+                : 'donation_submitted',
+            targetType: donationType == 'massOffering'
+                ? 'mass_offering'
+                : 'donation',
+            targetId: structuredId,
+            details: {
+              'donationType': donationType,
+              if (donationData['amount'] != null)
+                'amount': donationData['amount'],
+              'currency': donationData['currency'] ?? '',
+            },
+          ),
+        );
+      }
+      await batch.commit();
       debugPrint('DEBUG: Donation successfully saved to Firestore');
     } catch (e) {
       debugPrint('ERROR: Failed to save donation to Firestore: $e');
       debugPrint('ERROR: Error details: ${e.toString()}');
       rethrow;
     }
+  }
+
+  /// Save donation-drive commitments with an audit entry for signed-in users.
+  Future<void> submitDonationDriveCommitment(
+    Map<String, dynamic> submission,
+  ) async {
+    final user = auth.currentUser;
+    final submissionRef = firestore.collection('donation_submissions').doc();
+    final batch = firestore.batch();
+    batch.set(submissionRef, submission);
+    if (user != null) {
+      batch.set(
+        firestore.collection('audit_logs_app').doc(),
+        _auditLogData(
+          user,
+          action: 'drive_donation_submitted',
+          targetType: 'donation_drive_submission',
+          targetId: submissionRef.id,
+          details: {
+            'driveId': submission['driveId'] ?? '',
+            'driveTitle': submission['driveTitle'] ?? '',
+            'donationType': submission['donationType'] ?? '',
+            if (submission['amount'] != null)
+              'amount': submission['amount'],
+          },
+        ),
+      );
+    }
+    await batch.commit();
   }
 
   Future<Map<String, dynamic>> createXenditDonationInvoice({
@@ -1098,6 +1305,8 @@ class FirebaseService {
     String message = '',
     String offeringLocation = '',
     String paymentReturnType = 'donation',
+    String driveId = '',
+    String driveTitle = '',
   }) async {
     final callable = functions.httpsCallable('createXenditDonationInvoice');
     final result = await callable.call(<String, dynamic>{
@@ -1114,6 +1323,8 @@ class FirebaseService {
       'message': message,
       'offeringLocation': offeringLocation,
       'paymentReturnType': paymentReturnType,
+      'driveId': driveId,
+      'driveTitle': driveTitle,
     });
     final data = result.data;
     if (data is Map) {
@@ -1288,9 +1499,8 @@ class FirebaseService {
     return <String, dynamic>{};
   }
 
-  /// Returns only requested form keys that have a `booking_requirements`
-  /// record. Use small indexed query batches to avoid waiting for a full
-  /// collection scan before the home page can show cards.
+  /// Returns requested forms only when their booking requirements are approved.
+  /// Use small indexed query batches before scanning legacy records.
   Future<Set<String>> getAvailableBookingFormKeys(
     Iterable<String> formKeys,
   ) async {
@@ -1310,13 +1520,18 @@ class FirebaseService {
         requestedNames.skip(i).take(10).toList(growable: false),
       );
     }
-    final snapshots = await Future.wait(queryBatches.map((batch) async {
+    final snapshots = await Future.wait(queryBatches.expand((batch) => [
+      firestore
+          .collection('booking_requirements')
+          .where('sacramentType', whereIn: batch)
+          .get(),
+      firestore
+          .collection('booking_requirements')
+          .where('serviceType', whereIn: batch)
+          .get(),
+    ]).map((query) async {
       try {
-        return await firestore
-            .collection('booking_requirements')
-            .where('sacramentType', whereIn: batch)
-            .get()
-            .timeout(const Duration(seconds: 4));
+        return await query.timeout(const Duration(seconds: 4));
       } catch (error) {
         debugPrint('Failed to load booking form batch: $error');
         return null;
@@ -1329,10 +1544,28 @@ class FirebaseService {
         if (snapshot == null) continue;
         final matchingForms = snapshot.docs.where((form) {
           final data = form.data();
-          return _bookingFormKeysMatch(
-            (data['sacramentType'] ?? '').toString(),
-            key,
-          );
+          final candidates = <Object?>[
+            form.id,
+            data['formKey'],
+            data['sacramentTypeKey'],
+            data['bookingType'],
+            data['bookingFormName'],
+            data['sacramentType'],
+            data['sacrament'],
+            data['serviceType'],
+            data['serviceName'],
+            data['service'],
+            data['name'],
+            data['title'],
+            data['formName'],
+          ];
+          return (data['approvalStatus'] ?? '')
+                  .toString()
+                  .trim()
+                  .toLowerCase() ==
+              'approved' &&
+              candidates.any((value) =>
+                  _bookingFormKeysMatch(value?.toString() ?? '', key));
         }).toList(growable: false);
         if (matchingForms.isNotEmpty) {
           var describedForm = matchingForms.first;
@@ -1353,26 +1586,36 @@ class FirebaseService {
       }
     }
 
-    // Keep compatibility with older records whose booking type is stored in
-    // another field. Only do the collection read when the indexed lookup did
-    // not find any forms, so normal home loads stay on the fast path.
-    if (availableKeys.isEmpty) {
+    // Keep compatibility with records whose type is stored in a non-indexed
+    // field. Read all records here so forms beyond the first 100 can still be
+    // found when the indexed lookup does not match their stored schema.
+    if (availableKeys.length < requestedKeys.length) {
       try {
         final legacyForms = await firestore
             .collection('booking_requirements')
-            .limit(100)
             .get()
             .timeout(const Duration(seconds: 4));
         for (final key in requestedKeys) {
           for (final form in legacyForms.docs) {
             final data = form.data();
+            if ((data['approvalStatus'] ?? '')
+                    .toString()
+                    .trim()
+                    .toLowerCase() !=
+                'approved') {
+              continue;
+            }
             final candidates = <Object?>[
               form.id,
               data['formKey'],
               data['sacramentTypeKey'],
               data['bookingType'],
+              data['bookingFormName'],
               data['sacramentType'],
+              data['sacrament'],
               data['serviceType'],
+              data['serviceName'],
+              data['service'],
               data['name'],
               data['title'],
               data['formName'],
@@ -1392,6 +1635,24 @@ class FirebaseService {
     return availableKeys;
   }
 
+  Future<String?> getBookingFormCategory(String formKey) async {
+    final normalizedKey = _normalizeBookingFormKey(formKey);
+    final data = _bookingFormCache[normalizedKey] ??
+        await getBookingFormDefinition(formKey);
+    if (data == null) return null;
+
+    for (final field in const [
+      'bookingCategory',
+      'booking_category',
+      'formCategory',
+      'category',
+    ]) {
+      final category = data[field]?.toString().trim();
+      if (category != null && category.isNotEmpty) return category;
+    }
+    return null;
+  }
+
   /// The redirect from Xendit is navigation only.  This asks the server to
   /// retrieve the invoice from Xendit before the app acknowledges a payment.
   Future<String> getVerifiedXenditPaymentStatus({
@@ -1409,14 +1670,12 @@ class FirebaseService {
 
   /// Loads the editable requirements for a booking form.
   ///
-  /// `booking_requirements` is the preferred collection. `booking_forms` is
-  /// also checked so existing, already-seeded parish records keep working
-  /// while they are migrated to the preferred collection.
+  /// Only approved definitions in `booking_requirements` may be booked.
   Future<Map<String, dynamic>?> getBookingFormDefinition(String formKey) async {
     final key = formKey.trim();
     if (key.isEmpty) return null;
-    final cached = _bookingFormCache[_normalizeBookingFormKey(key)];
-    if (cached != null) return cached;
+    final cacheKey = _normalizeBookingFormKey(key);
+    _bookingFormCache.remove(cacheKey);
 
     // Most current booking_requirements records use generated document IDs
     // and identify the sacrament/service in `sacramentType`. Resolve this in
@@ -1427,9 +1686,15 @@ class FirebaseService {
           .where('sacramentType', isEqualTo: _bookingFormDisplayName(key))
           .limit(10)
           .get();
-      if (snapshot.docs.isNotEmpty) {
-        var matchingDoc = snapshot.docs.first;
-        for (final form in snapshot.docs) {
+      final approvedDocs = snapshot.docs.where((form) =>
+          (form.data()['approvalStatus'] ?? '')
+                  .toString()
+                  .trim()
+                  .toLowerCase() ==
+              'approved');
+      if (approvedDocs.isNotEmpty) {
+        var matchingDoc = approvedDocs.first;
+        for (final form in approvedDocs) {
           if ((form.data()['description'] ?? '')
               .toString()
               .trim()
@@ -1447,10 +1712,7 @@ class FirebaseService {
     }
 
     try {
-      for (final collectionName in const [
-        'booking_requirements',
-        'booking_forms',
-      ]) {
+      for (final collectionName in const ['booking_requirements']) {
         try {
           final collection = firestore.collection(collectionName);
           final doc = await collection.doc(key).get();
@@ -1472,9 +1734,15 @@ class FirebaseService {
                   .where(field, isEqualTo: lookupValue)
                   .limit(10)
                   .get();
-              if (snapshot.docs.isNotEmpty) {
+              final approvedDocs = snapshot.docs.where((form) =>
+                  (form.data()['approvalStatus'] ?? '')
+                          .toString()
+                          .trim()
+                          .toLowerCase() ==
+                      'approved');
+              if (approvedDocs.isNotEmpty) {
                 Map<String, dynamic>? describedRecord;
-                for (final form in snapshot.docs) {
+                for (final form in approvedDocs) {
                   final data = form.data();
                   if ((data['description'] ?? '')
                       .toString()
@@ -1484,7 +1752,7 @@ class FirebaseService {
                     break;
                   }
                 }
-                return describedRecord ?? snapshot.docs.first.data();
+                return describedRecord ?? approvedDocs.first.data();
               }
             }
           }
@@ -1496,6 +1764,13 @@ class FirebaseService {
           Map<String, dynamic>? matchingRecord;
           for (final form in allForms.docs) {
             final data = form.data();
+            if ((data['approvalStatus'] ?? '')
+                    .toString()
+                    .trim()
+                    .toLowerCase() !=
+                'approved') {
+              continue;
+            }
             final candidates = <Object?>[
               form.id,
               data['formKey'],
@@ -1516,7 +1791,14 @@ class FirebaseService {
             }
           }
           if (matchingRecord != null) return matchingRecord;
-          if (directMatch != null) return directMatch;
+          if (directMatch != null &&
+              (directMatch['approvalStatus'] ?? '')
+                      .toString()
+                      .trim()
+                      .toLowerCase() ==
+                  'approved') {
+            return directMatch;
+          }
         } catch (e) {
           debugPrint('Failed to check $collectionName/$key: $e');
         }
@@ -1545,6 +1827,23 @@ class FirebaseService {
         candidateKey == 'requirement$requested') {
       return true;
     }
+    if (requested == 'renewalofvows' &&
+        candidateKey.contains('renewal') &&
+        candidateKey.contains('vow')) {
+      return true;
+    }
+    if (requested == 'funeral' &&
+        (candidateKey.contains('funeral') ||
+            (candidateKey.contains('misa') &&
+                candidateKey.contains('yumao')))) {
+      return true;
+    }
+    if (requested == 'houseblessing' &&
+        ((candidateKey.contains('house') && candidateKey.contains('bless')) ||
+            (candidateKey.contains('basbas') &&
+                candidateKey.contains('bahay')))) {
+      return true;
+    }
 
     const aliases = <String, List<String>>{
       'baptism': ['binyag'],
@@ -1555,6 +1854,14 @@ class FirebaseService {
       'anointing': ['anointingofthesick', 'pagpapahidsamaysakit'],
       'massintention': ['intensyonngmisa'],
       'firstcommunion': ['unangkomunyon'],
+      'renewalofvows': [
+        'renewalofvow',
+        'renewalvows',
+        'renewalvow',
+        'renewalofweddingvows',
+        'renewalofvowsservice',
+        'pagpapanibagongpanata',
+      ],
     };
     return aliases[requested]?.map(normalize).contains(candidateKey) ?? false;
   }
@@ -1565,8 +1872,19 @@ class FirebaseService {
       'baptism': ['Baptism', 'Binyag'],
       'confirmation': ['Confirmation', 'Kumpil'],
       'wedding': ['Wedding', 'Holy Matrimony', 'Kasal'],
-      'funeral': ['Funeral', 'Funeral Mass', 'Misa para sa Yumao'],
-      'houseblessing': ['House Blessing', 'Basbas ng Bahay'],
+      'funeral': [
+        'Funeral',
+        'Funeral Mass',
+        'Funeral Mass Sacrament',
+        'Mass for the Departed',
+        'Misa para sa Yumao',
+      ],
+      'houseblessing': [
+        'House Blessing',
+        'Blessing of the House',
+        'House Blessing Service',
+        'Basbas ng Bahay',
+      ],
       'anointing': [
         'Anointing',
         'Anointing of the Sick',
@@ -1574,6 +1892,13 @@ class FirebaseService {
       ],
       'massintention': ['Mass Intention', 'Intensyon ng Misa'],
       'firstcommunion': ['First Communion', 'Unang Komunyon'],
+      'renewalofvows': [
+        'Renewal of Vows',
+        'Renewal of the Vows',
+        'Renewal of Marriage Vows',
+        'Renewal of Vows Service',
+        'Pagpapanibago ng Panata',
+      ],
     };
     return displayNameAliases[normalized] ?? [_bookingFormDisplayName(key)];
   }
@@ -1659,10 +1984,15 @@ class FirebaseService {
                   .toString(),
         );
       }
+      return SchedulingConflictResult.noConflict();
     } catch (e) {
       debugPrint(
         'FirebaseService: Cloud Function conflict check failed, using local fallback: $e',
       );
+    }
+
+    if (typeKey == 'mass_intention') {
+      return SchedulingConflictResult.noConflict();
     }
 
     try {
@@ -1678,7 +2008,7 @@ class FirebaseService {
           (availability['periodBookedCount'] as num?)?.toInt() ?? 0;
       if (status == 'fully_booked' ||
           overlapCount > 0 ||
-          periodBookedCount > 0) {
+          periodBookedCount >= 2) {
         return SchedulingConflictResult.conflict(
           bookingId: '',
           sacramentType: sacramentType,
@@ -1701,6 +2031,7 @@ class FirebaseService {
   Future<void> submitBooking({
     required String sacramentType,
     required Map<String, dynamic> details,
+    Map<String, dynamic>? feeBreakdown,
     bool checkConflict = true,
   }) async {
     final currentUser = auth.currentUser;
@@ -1802,9 +2133,28 @@ class FirebaseService {
       'assignedPriest': '',
       'adminNotes': '',
     };
+    if (feeBreakdown != null) {
+      document['feeBreakdown'] = feeBreakdown;
+    }
 
     // Use structured ID as document ID
-    await firestore.collection('bookings').doc(structuredId).set(document);
+    final batch = firestore.batch();
+    batch.set(firestore.collection('bookings').doc(structuredId), document);
+    batch.set(
+      firestore.collection('audit_logs_app').doc(),
+      _auditLogData(
+        currentUser,
+        action: 'booking_submitted',
+        targetType: 'booking',
+        targetId: structuredId,
+        details: {
+          'sacramentType': sacramentType,
+          'date': date,
+          'time': time,
+        },
+      ),
+    );
+    await batch.commit();
 
     debugPrint(
       'FirebaseService: Booking submitted successfully - $structuredId',
@@ -2003,170 +2353,15 @@ class FirebaseService {
     required String time,
     required String sacramentType,
   }) async {
-    final canonicalType = _canonicalSacramentTypeKey(sacramentType);
-    if (canonicalType == 'mass_intention') {
+    if (_canonicalSacramentTypeKey(sacramentType) == 'mass_intention') {
       return false;
     }
 
-    int? parseTimeToMinutes(String value) {
-      final raw = value
-          .replaceAll('\u00A0', ' ')
-          .replaceAll('\u202F', ' ')
-          .trim();
-      if (raw.isEmpty) return null;
-      final extracted = RegExp(
-        r'\b(\d{1,2}(?::\d{2})?[\s\u00A0\u202F]*(?:[AaPp][Mm])?)\b',
-      ).firstMatch(raw)?.group(1);
-      if (extracted == null) return null;
-
-      final match = RegExp(
-        r'^(\d{1,2})(?::(\d{2}))?[\s\u00A0\u202F]*([AaPp][Mm])?$',
-      ).firstMatch(extracted.trim());
-      if (match == null) return null;
-
-      int h = int.tryParse(match.group(1) ?? '') ?? -1;
-      final int m = int.tryParse(match.group(2) ?? '00') ?? -1;
-      if (h < 0 || m < 0 || m > 59) return null;
-
-      final ampm = (match.group(3) ?? '').toLowerCase();
-      if (ampm.isNotEmpty) {
-        if (h < 1 || h > 12) return null;
-        if (ampm == 'am') {
-          h = h == 12 ? 0 : h;
-        } else if (ampm == 'pm') {
-          h = h == 12 ? 12 : h + 12;
-        }
-      } else {
-        if (h > 23) return null;
-        if (h >= 1 && h <= 5) {
-          h += 12;
-        }
-      }
-
-      return h * 60 + m;
-    }
-
-    String schedulePeriod(int minutes) => minutes < 12 * 60 ? 'AM' : 'PM';
-
-    final requestedMinutes = parseTimeToMinutes(time);
-    if (requestedMinutes == null) {
-      return false;
-    }
-
-    // Define sacraments that should block same-time bookings
-    final timeBlockingSacraments = {
-      'Binyag',
-      'Baptism',
-      'Kasal',
-      'Wedding',
-      'Kumpil',
-      'Confirmation',
-      'Misa para sa Yumao',
-      'Funeral Mass',
-      'Palista sa House Blessing',
-      'House Blessing',
-      'Palista sa Pagpapahid ng Langis sa May Sakit',
-      'Anointing of the Sick',
-    };
-
-    final shouldBlockSameTime = timeBlockingSacraments.contains(
-      sacramentType.trim(),
+    final availableSlots = await getAvailableTimeSlots(
+      date: date,
+      allPossibleTimeSlots: [time],
     );
-
-    final requestedPeriod = schedulePeriod(requestedMinutes);
-    final blockWindowMinutes = shouldBlockSameTime ? 60 : 240;
-
-    final oldSnapshot = await firestore
-        .collection('sacrament_requests')
-        .where(
-          'status',
-          whereIn: [
-            'approved',
-            'accepted',
-            'confirmed',
-            'paid',
-            'Approved',
-            'Accepted',
-            'Confirmed',
-            'Paid',
-          ],
-        )
-        .get();
-    final newSnapshot = await firestore
-        .collection('bookings')
-        .where(
-          'status',
-          whereIn: [
-            'approved',
-            'accepted',
-            'confirmed',
-            'paid',
-            'Approved',
-            'Accepted',
-            'Confirmed',
-            'Paid',
-          ],
-        )
-        .get();
-
-    for (final doc in [...oldSnapshot.docs, ...newSnapshot.docs]) {
-      final data = doc.data();
-      final status = (data['status'] as String? ?? 'pending').toLowerCase();
-      if (status == 'cancelled' || status == 'rejected') continue;
-
-      final rowType = (data['sacramentType'] ?? '').toString().trim();
-      final rowTypeKey = _canonicalSacramentTypeKey(
-        (data['sacramentTypeKey'] ?? rowType).toString(),
-      );
-
-      // Same-day AM/PM limits are per sacrament type.
-      if (shouldBlockSameTime) {
-        if (rowTypeKey != canonicalType) {
-          continue;
-        }
-      } else {
-        if (rowType.isNotEmpty && rowType != sacramentType.trim()) {
-          continue;
-        }
-      }
-
-      final details = data['details'] as Map<String, dynamic>? ?? {};
-      final fields = details['fields'] as Map<String, dynamic>? ?? {};
-
-      String foundDate = '';
-      String foundTime = '';
-
-      fields.forEach((k, v) {
-        final key = k.toString().toLowerCase();
-        final val = (v ?? '').toString().trim();
-        if (foundDate.isEmpty &&
-            (key.contains('date') || key.contains('petsa')) &&
-            val.contains('-')) {
-          foundDate = val;
-        }
-        if (foundTime.isEmpty &&
-            (key.contains('time') || key.contains('oras')) &&
-            val.contains(':')) {
-          foundTime = val;
-        }
-      });
-
-      if (foundDate.isNotEmpty &&
-          foundTime.isNotEmpty &&
-          foundDate == date.trim()) {
-        final foundMinutes = parseTimeToMinutes(foundTime);
-        if (foundMinutes == null) continue;
-        final diff = (foundMinutes - requestedMinutes).abs();
-        final sameServicePeriodIsTaken =
-            shouldBlockSameTime &&
-            schedulePeriod(foundMinutes) == requestedPeriod;
-        if (diff < blockWindowMinutes || sameServicePeriodIsTaken) {
-          return true;
-        }
-      }
-    }
-
-    return false;
+    return availableSlots.isEmpty;
   }
 
   /// Check if a date is blocked by parish booking rules.

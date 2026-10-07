@@ -10,6 +10,21 @@ class AnnouncementsScreen extends StatelessWidget {
 
   String _t(String tagalog, String english) => isTagalog ? tagalog : english;
 
+  bool _isApprovedAnnouncement(Map<String, dynamic> data) {
+    // Explicit inactive flags always hide an otherwise approved announcement.
+    if (data['active'] == false || data['isActive'] == false) return false;
+
+    final approvalStatuses = [
+      data['approvalStatus'],
+      data['approval_status'],
+      data['approvalstatus'],
+      data['status'],
+    ];
+    return approvalStatuses.any(
+      (value) => value.toString().trim().toLowerCase() == 'approved',
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isMobile = MediaQuery.of(context).size.width < 1024;
@@ -104,7 +119,6 @@ class AnnouncementsScreen extends StatelessWidget {
               child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
                 stream: FirebaseFirestore.instance
                     .collection('announcements')
-                    .orderBy('createdAt', descending: true)
                     .snapshots(),
                 builder: (context, snapshot) {
                   if (snapshot.connectionState == ConnectionState.waiting) {
@@ -121,7 +135,20 @@ class AnnouncementsScreen extends StatelessWidget {
                     );
                   }
 
-                  final docs = snapshot.data?.docs ?? [];
+                  final docs = (snapshot.data?.docs ?? [])
+                      .where((doc) => _isApprovedAnnouncement(doc.data()))
+                      .toList()
+                    ..sort((a, b) {
+                      final aCreatedAt = a.data()['createdAt'];
+                      final bCreatedAt = b.data()['createdAt'];
+                      final aDate = aCreatedAt is Timestamp
+                          ? aCreatedAt.toDate()
+                          : DateTime.fromMillisecondsSinceEpoch(0);
+                      final bDate = bCreatedAt is Timestamp
+                          ? bCreatedAt.toDate()
+                          : DateTime.fromMillisecondsSinceEpoch(0);
+                      return bDate.compareTo(aDate);
+                    });
                   if (docs.isEmpty) {
                     return Center(
                       child: Text(

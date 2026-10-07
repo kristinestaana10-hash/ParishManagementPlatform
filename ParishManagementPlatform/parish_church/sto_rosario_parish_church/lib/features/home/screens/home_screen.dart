@@ -41,6 +41,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isLoading = true;
   bool _bookingFormsLoading = true;
   final Set<SacramentType> _availableBookingForms = {};
+  final Map<SacramentType, String> _bookingCategories = {};
   DateTime? _userBirthday;
   int? _userAge;
 
@@ -57,18 +58,29 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// Home cards are shown only for form records that exist in Firestore.
-  /// The service batches this into two collection reads, avoiding a separate
-  /// database query for every sacrament card.
+  /// Home cards are shown only for approved form records in Firestore.
+  /// Approved forms are fetched in indexed batches and then grouped using
+  /// each form's booking category.
   Future<void> _loadAvailableBookingForms() async {
     try {
       final availableKeys = await FirebaseService.instance
           .getAvailableBookingFormKeys(
             SacramentType.values.map((type) => type.bookingFormKey),
           );
+      final bookingCategories = <SacramentType, String>{};
+      for (final type in SacramentType.values) {
+        if (!availableKeys.contains(type.bookingFormKey)) continue;
+        final category = await FirebaseService.instance.getBookingFormCategory(
+          type.bookingFormKey,
+        );
+        if (category != null) bookingCategories[type] = category;
+      }
 
       if (!mounted) return;
       setState(() {
+        _bookingCategories
+          ..clear()
+          ..addAll(bookingCategories);
         _availableBookingForms
           ..clear()
           ..addAll(
@@ -87,8 +99,32 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _hasBookingForm(SacramentType type) =>
       _availableBookingForms.contains(type);
 
-  bool _hasAnyBookingForm(Iterable<SacramentType> types) =>
-      types.any(_hasBookingForm);
+  bool _isServiceBookingForm(SacramentType type) {
+    // These two forms keep their established Home sections even if an older
+    // booking_requirements record has a missing or incorrect category value.
+    if (type == SacramentType.funeral) return false;
+    if (type == SacramentType.houseBlessing ||
+        type == SacramentType.massIntention) {
+      return true;
+    }
+
+    final category = _bookingCategories[type]?.trim().toLowerCase();
+    if (category != null && category.isNotEmpty) {
+      if (category.contains('sacrament')) return false;
+      if (category.contains('service')) return true;
+    }
+    return {
+      SacramentType.houseBlessing,
+      SacramentType.massIntention,
+      SacramentType.renewalOfVows,
+    }.contains(type);
+  }
+
+  bool _hasBookingFormsInCategory({required bool services}) =>
+      SacramentType.values.any(
+        (type) =>
+            _hasBookingForm(type) && _isServiceBookingForm(type) == services,
+      );
 
   /// Fetch user's birthday from Firestore
   Future<void> _loadUserBirthday() async {
@@ -1011,18 +1047,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
             if (!_bookingFormsLoading &&
                 (widget.isGuest || _userAge == null || _userAge! >= 18) &&
-                _hasAnyBookingForm(const [
-                  SacramentType.baptism,
-                  SacramentType.confirmation,
-                  SacramentType.wedding,
-                  SacramentType.funeral,
-                  SacramentType.firstCommunion,
-                ]))
+                _hasBookingFormsInCategory(services: false))
               sectionContainer(
                 title: t('Mga Sakramento', 'Sacraments'),
                 children: [
                   cardsGrid([
-                    if (_hasBookingForm(SacramentType.baptism)) SacramentCard(
+                    if (_hasBookingForm(SacramentType.baptism) &&
+                        !_isServiceBookingForm(SacramentType.baptism)) SacramentCard(
                       title: t('Binyag', 'Baptism'),
                       description: t(
                         'Sakramento ng Kristiyanong Pagsisimula',
@@ -1033,7 +1064,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       onTap: () => widget.onSacramentTap(SacramentType.baptism),
                       isMobile: isMobile,
                     ),
-                    if (_hasBookingForm(SacramentType.confirmation))
+                    if (_hasBookingForm(SacramentType.confirmation) &&
+                        !_isServiceBookingForm(SacramentType.confirmation))
                       SacramentCard(
                       title: t('Kumpil', 'Confirmation'),
                       description: t(
@@ -1047,6 +1079,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       isMobile: isMobile,
                     ),
                     if (_hasBookingForm(SacramentType.wedding) &&
+                        !_isServiceBookingForm(SacramentType.wedding) &&
                         _isSacramentAvailable(SacramentType.wedding))
                       SacramentCard(
                         title: t('Kasal', 'Wedding'),
@@ -1057,7 +1090,8 @@ class _HomeScreenState extends State<HomeScreen> {
                             widget.onSacramentTap(SacramentType.wedding),
                         isMobile: isMobile,
                       ),
-                    if (_hasBookingForm(SacramentType.funeral)) SacramentCard(
+                    if (_hasBookingForm(SacramentType.funeral) &&
+                        !_isServiceBookingForm(SacramentType.funeral)) SacramentCard(
                       title: t('Misa para sa Yumao', 'Funeral Mass'),
                       description: t(
                         'Panalangin para sa Namatay',
@@ -1068,7 +1102,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       onTap: () => widget.onSacramentTap(SacramentType.funeral),
                       isMobile: isMobile,
                     ),
-                    if (_hasBookingForm(SacramentType.firstCommunion))
+                    if (_hasBookingForm(SacramentType.firstCommunion) &&
+                        !_isServiceBookingForm(SacramentType.firstCommunion))
                       SacramentCard(
                       title: t('Unang Komunyon', 'First Communion'),
                       description: t(
@@ -1081,31 +1116,58 @@ class _HomeScreenState extends State<HomeScreen> {
                           widget.onSacramentTap(SacramentType.firstCommunion),
                       isMobile: isMobile,
                     ),
+                    if (_hasBookingForm(SacramentType.anointing) &&
+                        !_isServiceBookingForm(SacramentType.anointing))
+                      SacramentCard(
+                        title: t(
+                          'Pagpapahid sa May Sakit',
+                          'Anointing of the Sick',
+                        ),
+                        description: t(
+                          'Sakramento ng Pagpapagaling',
+                          'Sacrament of Healing',
+                        ),
+                        assetPath: SacramentType.anointing.assetPath(),
+                        gradient: ParishGradients.anointingGradient,
+                        onTap: () =>
+                            widget.onSacramentTap(SacramentType.anointing),
+                        isMobile: isMobile,
+                      ),
+                    if (_hasBookingForm(SacramentType.renewalOfVows) &&
+                        !_isServiceBookingForm(SacramentType.renewalOfVows))
+                      SacramentCard(
+                        title: t(
+                          'Pagpapanibago ng Panata',
+                          'Renewal of Vows',
+                        ),
+                        description: t(
+                          'Pagpapatibay muli ng pangakong mag-asawa',
+                          'Celebrate a renewal of marriage vows',
+                        ),
+                        assetPath: SacramentType.renewalOfVows.assetPath(),
+                        gradient: ParishGradients.weddingGradient,
+                        onTap: () =>
+                            widget.onSacramentTap(SacramentType.renewalOfVows),
+                        isMobile: isMobile,
+                      ),
                   ]),
                 ],
               ),
 
             if (!_bookingFormsLoading &&
                 (widget.isGuest || _userAge == null || _userAge! >= 18) &&
-                _hasAnyBookingForm(const [
-                  SacramentType.houseBlessing,
-                  SacramentType.anointing,
-                  SacramentType.massIntention,
-                ]))
+                _hasBookingFormsInCategory(services: true))
               SizedBox(height: isMobile ? 12 : 16),
 
             if (!_bookingFormsLoading &&
                 (widget.isGuest || _userAge == null || _userAge! >= 18) &&
-                _hasAnyBookingForm(const [
-                  SacramentType.houseBlessing,
-                  SacramentType.anointing,
-                  SacramentType.massIntention,
-                ]))
+                _hasBookingFormsInCategory(services: true))
               sectionContainer(
                 title: t('Mga Serbisyo', 'Services'),
                 children: [
                   cardsGrid([
-                    if (_hasBookingForm(SacramentType.houseBlessing))
+                    if (_hasBookingForm(SacramentType.houseBlessing) &&
+                        _isServiceBookingForm(SacramentType.houseBlessing))
                       SacramentCard(
                       title: t('Basbas ng Bahay', 'House Blessing'),
                       description: t(
@@ -1118,22 +1180,8 @@ class _HomeScreenState extends State<HomeScreen> {
                           widget.onSacramentTap(SacramentType.houseBlessing),
                       isMobile: isMobile,
                     ),
-                    if (_hasBookingForm(SacramentType.anointing)) SacramentCard(
-                      title: t(
-                        'Pagpapahid sa May Sakit',
-                        'Anointing of the Sick',
-                      ),
-                      description: t(
-                        'Sakramento ng Pagpapagaling',
-                        'Sacrament of Healing',
-                      ),
-                      assetPath: SacramentType.anointing.assetPath(),
-                      gradient: ParishGradients.anointingGradient,
-                      onTap: () =>
-                          widget.onSacramentTap(SacramentType.anointing),
-                      isMobile: isMobile,
-                    ),
-                    if (_hasBookingForm(SacramentType.massIntention))
+                    if (_hasBookingForm(SacramentType.massIntention) &&
+                        _isServiceBookingForm(SacramentType.massIntention))
                       SacramentCard(
                       title: t('Intensyon ng Misa', 'Mass Intention'),
                       description: t(
@@ -1146,16 +1194,29 @@ class _HomeScreenState extends State<HomeScreen> {
                           widget.onSacramentTap(SacramentType.massIntention),
                       isMobile: isMobile,
                     ),
+                    if (_hasBookingForm(SacramentType.renewalOfVows) &&
+                        _isServiceBookingForm(SacramentType.renewalOfVows))
+                      SacramentCard(
+                        title: t(
+                          'Pagpapanibago ng Panata',
+                          'Renewal of Vows',
+                        ),
+                        description: t(
+                          'Pagpapatibay muli ng pangakong mag-asawa',
+                          'Celebrate a renewal of marriage vows',
+                        ),
+                        assetPath: SacramentType.renewalOfVows.assetPath(),
+                        gradient: ParishGradients.weddingGradient,
+                        onTap: () =>
+                            widget.onSacramentTap(SacramentType.renewalOfVows),
+                        isMobile: isMobile,
+                      ),
                   ]),
                 ],
               ),
             if (!_bookingFormsLoading &&
                 (widget.isGuest || _userAge == null || _userAge! >= 18) &&
-                _hasAnyBookingForm(const [
-                  SacramentType.houseBlessing,
-                  SacramentType.anointing,
-                  SacramentType.massIntention,
-                ]))
+                _hasBookingFormsInCategory(services: true))
               SizedBox(height: isMobile ? 24 : 32),
           ],
         ),

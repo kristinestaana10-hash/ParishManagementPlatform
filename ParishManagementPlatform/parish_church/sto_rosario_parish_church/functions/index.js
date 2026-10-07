@@ -541,10 +541,12 @@ const RESTRICTED_SERVICES = [
 ];
 
 const ACTIVE_BOOKING_STATUSES = [
+  'pending',
   'approved',
   'accepted',
   'confirmed',
   'paid',
+  'Pending',
   'Approved',
   'Accepted',
   'Confirmed',
@@ -586,12 +588,6 @@ async function checkSchedulingConflict(db, date, time, canonicalType, excludeBoo
       return null; // No conflict
     }
 
-    // Non-restricted services don't need conflict checking
-    if (!isRestrictedService(canonicalType)) {
-      console.log(`checkSchedulingConflict: ${canonicalType} is not a restricted service`);
-      return null; // No conflict
-    }
-
     // If no date provided, skip check
     if (!date || date.trim().length === 0) {
       console.log('checkSchedulingConflict: No date provided, skipping check');
@@ -622,7 +618,8 @@ async function checkSchedulingConflict(db, date, time, canonicalType, excludeBoo
       .where('status', 'in', ACTIVE_BOOKING_STATUSES)
       .get();
 
-    // Check each booking for time overlap
+    let periodBookingCount = 0;
+    const seenBookingIds = new Set();
     for (const doc of [...newSnap.docs, ...oldSnap.docs]) {
       const booking = doc.data();
       
@@ -630,13 +627,15 @@ async function checkSchedulingConflict(db, date, time, canonicalType, excludeBoo
       if (excludeBookingId && doc.id === excludeBookingId) {
         continue;
       }
+      if (seenBookingIds.has(doc.id)) continue;
+      seenBookingIds.add(doc.id);
 
       const {
         canonicalType: bookingCanonicalType,
         date: bookingDate,
         time: bookingTime,
       } = bookingScheduleValues(booking, canonicalType);
-      if (!isRestrictedService(bookingCanonicalType)) {
+      if (isMassIntention(bookingCanonicalType)) {
         continue;
       }
       if (bookingDate !== date) {
@@ -649,33 +648,20 @@ async function checkSchedulingConflict(db, date, time, canonicalType, excludeBoo
 
         if (bookingMinutes == null) continue;
 
-        if (Math.abs(requestedMinutes - bookingMinutes) < 60) {
-          console.log(`checkSchedulingConflict: 1-hour overlap detected with booking ${doc.id}`);
+        if (requestedMinutes === bookingMinutes) {
+          console.log(`checkSchedulingConflict: exact time is occupied by booking ${doc.id}`);
           return {
             conflictingBookingId: doc.id,
             conflictingSacramentType: booking.sacramentType,
             conflictingUserName: booking.userName || 'Another Parishioner',
             conflictingDate: date,
             conflictingTime: bookingTime,
-            message: 'The selected date and time overlaps with another approved booking. Please choose a time at least 1 hour apart.',
+            message: 'This exact time is already booked. Please choose another time.',
           };
         }
 
         const bookingPeriod = schedulePeriodFromMinutes(bookingMinutes);
-        if (
-          bookingCanonicalType === canonicalType &&
-          bookingPeriod === requestedPeriod
-        ) {
-          console.log(`checkSchedulingConflict: ${requestedPeriod} period already occupied by booking ${doc.id}`);
-          return {
-            conflictingBookingId: doc.id,
-            conflictingSacramentType: booking.sacramentType,
-            conflictingUserName: booking.userName || 'Another Parishioner',
-            conflictingDate: date,
-            conflictingTime: bookingTime,
-            message: `Only 1 ${canonicalType} booking is allowed in the ${requestedPeriod} schedule for this date. Please choose another available schedule.`,
-          };
-        }
+        if (bookingPeriod === requestedPeriod) periodBookingCount++;
       } else if (!time || time.trim().length === 0) {
         // If time not specified but date matches, it's a potential conflict
         // (since we can't determine exact timing)
@@ -688,6 +674,17 @@ async function checkSchedulingConflict(db, date, time, canonicalType, excludeBoo
           conflictingTime: bookingTime || 'Not specified',
         };
       }
+    }
+
+    if (periodBookingCount >= 2) {
+      return {
+        conflictingBookingId: '',
+        conflictingSacramentType: canonicalType,
+        conflictingUserName: 'System',
+        conflictingDate: date,
+        conflictingTime: time,
+        message: `The ${requestedPeriod} schedule is full for this date. Only two bookings are allowed in each period.`,
+      };
     }
 
     console.log('checkSchedulingConflict: No conflicts detected');
@@ -931,6 +928,10 @@ async function sendInvoiceEmail({
     auth: { user: smtpUser, pass: smtpPass },
   });
   const formattedAmount = formatPhp(amount);
+  const isDonationOrOffering = /donation|offering/i.test(invoiceType);
+  const invoiceSummary = isDonationOrOffering
+    ? `Thank you for supporting the parish. Your ${invoiceType.toLowerCase()} details are below.`
+    : `Your ${invoiceType.toLowerCase()} invoice has been created. Payment is pending until Xendit confirms it.`;
   await transporter.sendMail({
     from: `${fromName} <${smtpUser}>`,
     to,
@@ -938,7 +939,7 @@ async function sendInvoiceEmail({
     text: [
       `Hello ${donorName},`,
       '',
-      `Your ${invoiceType.toLowerCase()} invoice has been created. Payment is pending until Xendit confirms it.`,
+      invoiceSummary,
       `Amount: ${formattedAmount}`,
       `Reference ID: ${referenceId}`,
       `Payment Link: ${invoiceUrl}`,
@@ -952,7 +953,7 @@ async function sendInvoiceEmail({
           </div>
           <div style="padding:24px;">
             <p style="margin:0 0 12px;">Hello <strong>${escapeHtml(donorName)}</strong>,</p>
-            <p style="margin:0 0 18px;line-height:1.6;">Your ${escapeHtml(invoiceType.toLowerCase())} invoice has been created. Payment is pending until Xendit confirms it.</p>
+            <p style="margin:0 0 18px;line-height:1.6;">${escapeHtml(invoiceSummary)}</p>
             <div style="height:4px;background:${EMAIL_BRAND.gold};margin:0 0 18px;"></div>
             <div style="background:${EMAIL_BRAND.bg};border:1px solid ${EMAIL_BRAND.border};border-radius:8px;padding:16px;line-height:1.8;">
               <div><span style="color:${EMAIL_BRAND.muted};">Amount:</span> <strong>${escapeHtml(formattedAmount)}</strong></div>
@@ -1538,7 +1539,8 @@ exports.createXenditDonationInvoice = onCall(
         throw new HttpsError('internal', 'Xendit did not return an invoice URL.');
       }
 
-      await donationRef.set({
+      const donationBatch = db.batch();
+      donationBatch.set(donationRef, {
         structuredId: structuredId,
         userId: uid,
         userName,
@@ -1564,6 +1566,34 @@ exports.createXenditDonationInvoice = onCall(
           status: invoiceStatus.toLowerCase(),
         },
       });
+      const isDriveDonation =
+        String(normalizedData.paymentReturnType || '').toLowerCase() === 'donationdrive' ||
+        Boolean(normalizedData.driveId);
+      const auditData = buildAuditLogData({
+        uid,
+        userName,
+        userEmail,
+        action: donationType === 'massOffering'
+          ? 'mass_offering_submitted'
+          : isDriveDonation
+            ? 'drive_donation_submitted'
+            : 'donation_submitted',
+        targetType: donationType === 'massOffering' ? 'mass_offering' : 'donation',
+        targetId: structuredId,
+        details: {
+          donationType,
+          amount: amountNumber,
+          currency: 'PHP',
+          paymentMethod: 'xendit',
+          paymentReturnType: String(normalizedData.paymentReturnType || 'donation'),
+          ...(normalizedData.driveId ? { driveId: String(normalizedData.driveId) } : {}),
+          ...(normalizedData.driveTitle ? { driveTitle: String(normalizedData.driveTitle) } : {}),
+        },
+      });
+      if (auditData) {
+        donationBatch.set(db.collection('audit_logs_app').doc(), auditData);
+      }
+      await donationBatch.commit();
 
       if (isValidEmail(donorEmail)) {
         try {
@@ -1675,7 +1705,8 @@ exports.createXenditMassOfferingInvoice = onCall(
         throw new HttpsError('internal', 'Xendit did not return an invoice URL.');
       }
 
-      await offeringRef.set({
+      const offeringBatch = db.batch();
+      offeringBatch.set(offeringRef, {
         structuredId,
         userId: uid,
         userName,
@@ -1701,6 +1732,25 @@ exports.createXenditMassOfferingInvoice = onCall(
           status: invoiceStatus.toLowerCase(),
         },
       });
+      const auditData = buildAuditLogData({
+        uid,
+        userName,
+        userEmail,
+        action: 'mass_offering_submitted',
+        targetType: 'mass_offering',
+        targetId: structuredId,
+        details: {
+          donationType,
+          amount: amountNumber,
+          currency: 'PHP',
+          paymentMethod: 'xendit',
+          offeringLocation,
+        },
+      });
+      if (auditData) {
+        offeringBatch.set(db.collection('audit_logs_app').doc(), auditData);
+      }
+      await offeringBatch.commit();
 
       if (isValidEmail(donorEmail)) {
         try {
@@ -2206,7 +2256,8 @@ exports.submitCertificateRequest = onCall(
     if (!existing.empty) throw new HttpsError('already-exists', 'You already have an active request for this certificate.');
     const user = await admin.auth().getUser(uid);
     const ref = db.collection('certificate_requests').doc();
-    await ref.create({
+    const requestBatch = db.batch();
+    requestBatch.create(ref, {
       userId: uid,
       userName: user.displayName || userEmail.split('@')[0],
       userEmail,
@@ -2217,6 +2268,16 @@ exports.submitCertificateRequest = onCall(
       requestDate: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+    requestBatch.set(db.collection('audit_logs_app').doc(), buildAuditLogData({
+      uid,
+      userName: user.displayName || userEmail.split('@')[0],
+      userEmail,
+      action: 'certificate_request_submitted',
+      targetType: 'certificate_request',
+      targetId: ref.id,
+      details: { certificateType: type },
+    }));
+    await requestBatch.commit();
     return { requestId: ref.id, status: 'Request Sent' };
   }
 );
@@ -2662,11 +2723,14 @@ exports.createXenditBookingInvoice = onCall(
       const canonicalType = canonicalSacramentType(sacramentType) || '';
       const rowDate = extractScheduleDateStringFromFields(fields, canonicalType);
       const rowTime = extractScheduleTimeStringFromFields(fields, canonicalType);
-      if (canonicalType === 'baptism') {
+      if (canonicalType === 'baptism' && !feeBreakdown.paymentOptionId) {
         amountNumber = baptismFeeForDate(rowDate || existingBooking.data()?.date || '');
         feeBreakdown.total = amountNumber;
         feeBreakdown.currency = 'PHP';
         feeBreakdown.rate = baptismFeeLabelForDate(rowDate || existingBooking.data()?.date || '');
+      } else if (canonicalType === 'baptism' && feeBreakdown.paymentOptionId) {
+        feeBreakdown.total = amountNumber;
+        feeBreakdown.currency = 'PHP';
       }
 
       // SCHEDULING CONFLICT CHECK
@@ -2692,7 +2756,7 @@ exports.createXenditBookingInvoice = onCall(
               'The selected date and time does not match any official Mass schedule. Please select a valid Mass schedule.'
             );
           }
-        } else if (isRestrictedService(canonicalType)) {
+        } else if (!isMassIntention(canonicalType)) {
           if (!rowDate || !rowTime || rowTime.trim().length === 0) {
             throw new HttpsError(
               'invalid-argument',
@@ -2860,7 +2924,10 @@ exports.getBookingAvailability = onCall(
     let matches = 0;
     let overlaps = 0;
     let periodMatches = 0;
+    const seenBookingIds = new Set();
     for (const doc of [...newSnap.docs, ...oldSnap.docs]) {
+      if (seenBookingIds.has(doc.id)) continue;
+      seenBookingIds.add(doc.id);
       const row = doc.data() || {};
       const {
         canonicalType: resolvedTypeKey,
@@ -2868,33 +2935,25 @@ exports.getBookingAvailability = onCall(
         time: rowTime,
       } = bookingScheduleValues(row, requestedCanonicalType);
 
-      if (!resolvedTypeKey || !isRestrictedService(resolvedTypeKey)) {
-        continue;
-      }
+      if (!resolvedTypeKey || isMassIntention(resolvedTypeKey)) continue;
       if (!rowDate || rowDate !== date) continue;
 
+      matches += 1;
       if (time) {
         if (!rowTime) continue;
         const rowMinutes = parseTimeToMinutes(rowTime);
         if (rowMinutes == null) continue;
-        if (Math.abs(rowMinutes - requestedMinutes) < 60) overlaps += 1;
-        if (
-          resolvedTypeKey === requestedCanonicalType &&
-          schedulePeriodFromMinutes(rowMinutes) === requestedPeriod
-        ) {
+        if (rowMinutes === requestedMinutes) overlaps += 1;
+        if (schedulePeriodFromMinutes(rowMinutes) === requestedPeriod) {
           periodMatches += 1;
         }
       }
-
-      if (!requestedCanonicalType || resolvedTypeKey === requestedCanonicalType) {
-        matches += 1;
-      }
     }
 
-    const capacity = time ? 1 : 2;
+    const capacity = 2;
     let status = 'available';
-    if (time && (overlaps > 0 || periodMatches > 0)) status = 'fully_booked';
-    else if (!time && matches >= capacity) status = 'fully_booked';
+    if (time && (overlaps > 0 || periodMatches >= capacity)) status = 'fully_booked';
+    else if (!time && matches >= capacity * 2) status = 'fully_booked';
     else if (matches > 0) status = 'limited';
 
     // Privacy: return aggregate info only.
@@ -2912,19 +2971,19 @@ exports.getBookingAvailability = onCall(
 );
 
 const PARISH_ASSISTANT_CONTEXT = `You are the AI assistant for Sto. Rosario Parish Church.
-Answer only parish-related questions using facts in the supplied database context. The database context is authoritative and takes priority over every other source. Do not use general knowledge, infer missing facts, repeat facts from conversation history, or answer unrelated questions. If the requested fact is not in the database context, clearly state that the information is currently unavailable and, where appropriate, politely advise the parishioner to contact the parish office.
+Answer only parish-related questions using facts in the supplied parish information. This information is authoritative and takes priority over every other source. Do not use general knowledge, infer missing facts, repeat facts from conversation history, or answer unrelated questions. If the requested fact is not available, clearly say so and, where appropriate, politely advise the parishioner to contact the parish office. Never tell parishioners that an answer comes from a database, record, or internal source.
 
 Tone and presentation:
 - Write in a formal, clear, courteous, and pastoral manner suitable for a parish office.
 - Keep the answer focused on parish services, sacraments, bookings, schedules, announcements, donations, chapels, and other parish activities.
-- State only information supported by the supplied database context. Do not fill gaps with likely practices, estimates, or assumptions.
+- State only information supported by the supplied parish information. Do not fill gaps with likely practices, estimates, or assumptions.
 
 Privacy rules:
 - Never reveal private names, emails, phone numbers, addresses, payment methods, document links, health details, or specific booking owner details. Public parish contact details explicitly present in the supplied context may be shared.
 - For bookings and donations, answer with aggregate status or the signed-in user's own summarized records only.
 - If a user asks for another person's records or confidential details, politely refuse.
 - Match the user's language. Use Tagalog for Tagalog questions and English for English questions.
-- Fees, requirements, and schedules must come from the whitelisted real-time database context only. Never estimate prices or invent missing requirements.`;
+- Fees, requirements, and schedules must come from the approved parish information provided to you. Never estimate prices or invent missing requirements.`;
 
 function isParishAssistantTopic(message) {
   return /(parish|church|sto\.?\s*rosario|apo\s*sayong|misa|mass|binyag|baptism|kumpil|confirmation|kasal|wedding|funeral|yumao|house\s*blessing|basbas|anointing|communion|komunyon|sakramento|sacrament|booking|reserve|reservation|schedule|iskedyul|available|availability|slot|fee|bayad|price|requirement|rekisito|document|dokumento|donation|abuloy|alay|announcement|anunsyo|parish priest|pari|contact|address|location|office hours)/i.test(String(message || ''));
@@ -2932,8 +2991,8 @@ function isParishAssistantTopic(message) {
 
 function parishScopeReply(language) {
   return language === 'tagalog'
-    ? 'Makakasagot lamang ako tungkol sa Sto. Rosario Parish at sa opisyal na impormasyong naka-record sa parish database—halimbawa, mga schedule, serbisyo, requirements, fee, booking, at anunsyo.'
-    : 'I can only help with Sto. Rosario Parish and official information recorded in the parish database, such as schedules, services, requirements, fees, bookings, and announcements.';
+    ? 'Makakasagot lamang ako tungkol sa Sto. Rosario Parish at sa opisyal na impormasyon nito—gaya ng mga schedule, serbisyo, requirements, bayarin, booking, at anunsyo.'
+    : 'I can only help with Sto. Rosario Parish and its official information, such as schedules, services, requirements, fees, bookings, and announcements.';
 }
 
 function detectAssistantLanguage(text) {
@@ -3049,6 +3108,28 @@ async function parishServiceListAnswer(message, language, db) {
     ? `Narito ang mga sacrament at service na kasalukuyang maaaring i-book:\n${serviceList}\n\nPumili ng serbisyo sa Home screen upang makita ang booking form.`
     : `These sacraments and services are currently available to book:\n${serviceList}\n\nSelect a service on the Home screen to view its booking form.`;
 }
+
+function buildAuditLogData({
+  uid,
+  userName,
+  userEmail,
+  action,
+  targetType,
+  targetId,
+  details = {},
+}) {
+  if (!uid) return null;
+  return {
+    userId: uid,
+    userName: userName || '',
+    userEmail: userEmail || '',
+    action,
+    targetType,
+    targetId,
+    details,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
 function formatAssistantReply(reply) {
   const lines = String(reply || '')
     .split(/\r?\n/)
@@ -3101,6 +3182,12 @@ function formatAssistantReply(reply) {
     .replace(/[ \t]+([,.;!?])/g, '$1')
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
+    .replace(/\bbased on (?:the )?(?:current )?(?:parish )?database(?: record)?\b[,]?\s*/gi, 'The parish information indicates ')
+    .replace(/\baccording to (?:the )?(?:current )?(?:parish )?database(?: record)?\b[,]?\s*/gi, 'The parish information indicates ')
+    .replace(/\bbased on (?:the )?(?:current )?(?:parish )?record\b[,]?\s*/gi, 'The parish information indicates ')
+    .replace(/\baccording to (?:the )?(?:current )?(?:parish )?record\b[,]?\s*/gi, 'The parish information indicates ')
+    .replace(/\bdatabase\s+record\b/gi, 'parish information')
+    .replace(/\bdatabase\b/gi, 'parish information')
     .trim();
 }
 
@@ -3197,8 +3284,8 @@ function sanitizePublicValue(value, depth = 0) {
 
 function parishInformationUnavailableReply(language) {
   return language === 'tagalog'
-    ? 'Paumanhin, ang hinihingi ninyong impormasyon ay kasalukuyang walang opisyal na record sa parish system. Para sa tamang gabay, mangyaring makipag-ugnayan sa parish office.'
-    : 'We apologize, but the requested information is currently unavailable in the parish system. For accurate guidance, please contact the parish office.';
+    ? 'Paumanhin, wala akong kumpirmadong impormasyon tungkol dito sa ngayon. Para sa tamang gabay, mangyaring makipag-ugnayan sa parish office.'
+    : 'I don’t have confirmed information about this right now. For accurate guidance, please contact the parish office.';
 }
 
 // Parish profile documents are public in Firestore, but the assistant still
@@ -3263,9 +3350,6 @@ function serviceFactMatches(message, serviceFact) {
   const canonical = canonicalSacramentType(lower);
   if (!canonical) return true;
 
-  const haystack = JSON.stringify(serviceFact || {}).toLowerCase();
-  if (haystack.includes(canonical)) return true;
-
   const aliases = {
     baptism: ['baptism', 'binyag'],
     confirmation: ['confirmation', 'kumpil'],
@@ -3276,7 +3360,31 @@ function serviceFactMatches(message, serviceFact) {
     first_communion: ['first communion', 'first_communion', 'komunyon'],
     mass_intention: ['mass intention', 'mass_intention', 'intensyon'],
   };
-  return (aliases[canonical] || []).some((alias) => haystack.includes(alias));
+  const identityFields = [
+    'id',
+    'name',
+    'formName',
+    'title',
+    'label',
+    'type',
+    'service',
+    'serviceName',
+    'sacrament',
+    'sacramentType',
+    'sacramentTypeKey',
+    'displayNames',
+  ];
+  const identity = identityFields
+    .flatMap((field) => {
+      const value = serviceFact?.[field];
+      if (value && typeof value === 'object') return Object.values(value);
+      return value == null ? [] : [value];
+    })
+    .join(' ')
+    .toLowerCase();
+  return (aliases[canonical] || [canonical]).some((alias) =>
+    identity.includes(alias),
+  );
 }
 
 function collectFeeFacts(serviceFacts) {
@@ -3368,8 +3476,8 @@ function directServiceFactAnswer(language, intents, serviceFacts) {
 
   if (!serviceFacts.length) {
     return language === 'tagalog'
-      ? 'Wala pa akong nakitang opisyal na fee o requirement record sa database para sa tanong na ito. Para maiwasan ang maling sagot, hindi ako magbibigay ng tantya.'
-      : 'I could not find an official fee or requirement record in the database for that question. To avoid giving incorrect information, I will not estimate it.';
+      ? 'Wala akong maibigay na kumpirmadong impormasyon tungkol sa bayarin o requirements na ito sa ngayon. Para maiwasan ang maling sagot, hindi ako magbibigay ng tantya.'
+      : 'I don’t have confirmed fee or requirement information for that question right now. To avoid giving incorrect information, I won’t estimate it.';
   }
 
   const lines = [];
@@ -3377,8 +3485,8 @@ function directServiceFactAnswer(language, intents, serviceFacts) {
     const feeRows = collectFeeFacts(serviceFacts);
     if (!feeRows.length) {
       lines.push(language === 'tagalog'
-        ? 'Walang fee field na naka-record sa database para sa serbisyong iyon.'
-        : 'No fee field is recorded in the database for that service.');
+        ? 'Wala pang kumpirmadong impormasyon tungkol sa bayarin para sa serbisyong iyon.'
+        : 'Fee information for that service is not currently available.');
     } else {
       feeRows.forEach((row) => {
         const values = row.fees.map((fee) => {
@@ -3394,8 +3502,8 @@ function directServiceFactAnswer(language, intents, serviceFacts) {
     const requirementRows = collectRequirementFacts(serviceFacts);
     if (!requirementRows.length) {
       lines.push(language === 'tagalog'
-        ? 'Walang requirement field na naka-record sa database para sa serbisyong iyon.'
-        : 'No requirement field is recorded in the database for that service.');
+        ? 'Wala pang kumpirmadong impormasyon tungkol sa mga requirement para sa serbisyong iyon.'
+        : 'Requirement information for that service is not currently available.');
     } else {
       requirementRows.forEach((row) => {
         const values = row.requirements.map((item) => typeof item === 'string' ? item : JSON.stringify(item)).join('; ');
@@ -3405,8 +3513,8 @@ function directServiceFactAnswer(language, intents, serviceFacts) {
   }
 
   return language === 'tagalog'
-    ? `Narito ang impormasyong naka-record para sa serbisyong tinanong mo:\n${lines.join('\n')}`
-    : `Here is the information recorded for the service you asked about:\n${lines.join('\n')}`;
+    ? `Narito ang kasalukuyang impormasyon tungkol sa serbisyong tinanong mo:\n${lines.join('\n')}`
+    : `Here is the current information about the service you asked about:\n${lines.join('\n')}`;
 }
 
 function publicBookingSummary(doc) {
@@ -3578,7 +3686,10 @@ async function getPublicParishSnapshot(db, intents, message) {
       let matches = 0;
       let overlaps = 0;
       let periodMatches = 0;
+      const seenBookingIds = new Set();
       for (const doc of [...newSnap.docs, ...oldSnap.docs]) {
+        if (seenBookingIds.has(doc.id)) continue;
+        seenBookingIds.add(doc.id);
         const row = doc.data() || {};
         const {
           canonicalType: resolvedTypeKey,
@@ -3586,25 +3697,24 @@ async function getPublicParishSnapshot(db, intents, message) {
           time: rowTime,
         } = bookingScheduleValues(row, requestedCanonicalType);
 
-        if (!resolvedTypeKey || !isRestrictedService(resolvedTypeKey)) continue;
+        if (!resolvedTypeKey || isMassIntention(resolvedTypeKey)) continue;
         if (rowDate !== date) continue;
 
+        matches += 1;
         if (time) {
           const rowMinutes = parseTimeToMinutes(String(rowTime || ''));
           if (rowMinutes == null) continue;
-          if (Math.abs(rowMinutes - requestedMinutes) < 60) overlaps += 1;
-          if (resolvedTypeKey === requestedCanonicalType && schedulePeriodFromMinutes(rowMinutes) === requestedPeriod) {
+          if (rowMinutes === requestedMinutes) overlaps += 1;
+          if (schedulePeriodFromMinutes(rowMinutes) === requestedPeriod) {
             periodMatches += 1;
           }
         }
-
-        if (!requestedCanonicalType || resolvedTypeKey === requestedCanonicalType) matches += 1;
       }
 
-      const capacity = time ? 1 : 2;
+      const capacity = 2;
       let status = 'available';
-      if (time && (overlaps > 0 || periodMatches > 0)) status = 'fully_booked';
-      else if (!time && matches >= capacity) status = 'fully_booked';
+      if (time && (overlaps > 0 || periodMatches >= capacity)) status = 'fully_booked';
+      else if (!time && matches >= capacity * 2) status = 'fully_booked';
       else if (matches > 0) status = 'limited';
 
       snapshot.availability = {
@@ -3709,10 +3819,10 @@ Detected language: ${language}
 Detected intents: ${intents.join(', ')}
 Authenticated user: ${request.auth?.uid ? 'yes' : 'no'}
 
-Whitelisted real-time database context:
+Approved parish information:
 ${JSON.stringify({ publicData, userData }, null, 2)}
 
-Answer in a formal, courteous, easy-to-understand way for a first-time parishioner. Start with a direct answer, then explain the relevant next step in plain language when useful. Use short paragraphs and simple bullet points for lists. Do not use tables, pipe characters, or dense blocks of text. Explain app navigation in familiar terms such as “Home screen.” Avoid unexplained technical or church-specific terms. Cite only facts found in the supplied database context. Never answer from general knowledge or from the conversation history. If the context does not contain the requested fact, use the prescribed unavailable-information response. Do not mention implementation details, APIs, JSON, Firestore, database internals, or internal data paths such as bracketed publicData/userData field references unless the user asks technical support staff questions.`;
+Answer in a formal, courteous, easy-to-understand way for a first-time parishioner. Start with a direct answer, then explain the relevant next step in plain language when useful. Use short paragraphs and simple bullet points for lists. Do not use tables, pipe characters, or dense blocks of text. Explain app navigation in familiar terms such as “Home screen.” Avoid unexplained technical or church-specific terms. Use only facts found in the supplied parish information. Never answer from general knowledge or from the conversation history. If the information does not contain the requested fact, use the prescribed unavailable-information response. Do not mention where the information came from or refer to records, databases, implementation details, APIs, JSON, Firestore, or internal data paths such as bracketed publicData/userData field references unless the user asks technical support staff questions.`;
 
     const apiKey = (GROQ_API_KEY.value() || process.env.GROQ_API_KEY || '').trim();
     if (!apiKey) {
@@ -4292,9 +4402,16 @@ exports.xenditWebhook = onRequest(
         return;
       }
 
-      const targetType = resolvedDonationSnap && resolvedDonationSnap.exists ? 'donation' : 'booking';
+      const targetType = resolvedBookingSnap && resolvedBookingSnap.exists
+        ? 'booking'
+        : resolvedDonationSnap?.ref.parent.id === 'mass_offerings'
+          ? 'mass_offering'
+          : 'donation';
       const targetRef = resolvedDonationSnap && resolvedDonationSnap.exists ? resolvedDonationSnap.ref : resolvedBookingSnap.ref;
       const targetId = targetRef.id;
+      const targetData = (resolvedDonationSnap && resolvedDonationSnap.exists
+        ? resolvedDonationSnap
+        : resolvedBookingSnap).data() || {};
 
       console.log(`[${webhookId}] Processing ${status} status update for ${targetType}: ${targetId}`);
 
@@ -4320,7 +4437,24 @@ exports.xenditWebhook = onRequest(
 
       // Perform the update
       console.log(`[${webhookId}] Executing update on ${targetType} ${targetId}`, updateData);
-      await targetRef.set(updateData, { merge: true });
+      const nextStatus = updateData.status;
+      const statusChanged = nextStatus &&
+        String(targetData.status || '').toLowerCase() !== nextStatus;
+      const updateBatch = db.batch();
+      updateBatch.set(targetRef, updateData, { merge: true });
+      if (statusChanged && targetData.userId) {
+        const auditData = buildAuditLogData({
+          uid: String(targetData.userId),
+          userName: String(targetData.userName || ''),
+          userEmail: String(targetData.userEmail || ''),
+          action: 'transaction_status_updated',
+          targetType,
+          targetId,
+          details: { status: nextStatus, paymentProvider: 'xendit' },
+        });
+        updateBatch.set(db.collection('audit_logs_app').doc(), auditData);
+      }
+      await updateBatch.commit();
 
       // Verify the update was successful
       const updatedSnap = await targetRef.get();
@@ -4754,8 +4888,12 @@ exports.checkSchedulingConflict = onCall(
         .where('status', 'in', ACTIVE_BOOKING_STATUSES)
         .get();
 
+      let periodBookingCount = 0;
+      const seenBookingIds = new Set();
       for (const doc of [...existingBookings.docs, ...existingOldRequests.docs]) {
         if (bookingId && doc.id === bookingId) continue; // Skip self
+        if (seenBookingIds.has(doc.id)) continue;
+        seenBookingIds.add(doc.id);
 
         const booking = doc.data();
         const {
@@ -4763,30 +4901,35 @@ exports.checkSchedulingConflict = onCall(
           date: bookingDate,
           time: bookingTime,
         } = bookingScheduleValues(booking, canonicalType);
-        if (!isRestrictedService(bookingCanonicalType)) continue;
+        if (isMassIntention(bookingCanonicalType)) continue;
         if (bookingDate !== date) continue;
 
         const bookingMinutes = parseTimeToMinutes(String(bookingTime || ''));
         if (bookingMinutes == null) continue;
 
-        if (Math.abs(bookingMinutes - requestedMinutes) < 60) {
+        if (bookingMinutes === requestedMinutes) {
           conflictingBookings.push(doc.id);
           continue;
         }
 
-        if (
-          bookingCanonicalType === canonicalType &&
-          schedulePeriodFromMinutes(bookingMinutes) === requestedPeriod
-        ) {
-          conflictingBookings.push(doc.id);
+        if (schedulePeriodFromMinutes(bookingMinutes) === requestedPeriod) {
+          periodBookingCount++;
         }
       }
 
       if (conflictingBookings.length > 0) {
         return {
           hasConflict: true,
-          reason: `The selected date and time conflicts with another approved booking. Only 1 ${canonicalType} booking is allowed in the ${requestedPeriod} schedule and bookings must be at least 1 hour apart.`,
+          reason: 'This exact time is already booked. Please choose another time.',
           conflictingBookings,
+        };
+      }
+
+      if (periodBookingCount >= 2) {
+        return {
+          hasConflict: true,
+          reason: `The ${requestedPeriod} schedule is full for this date. Only two bookings are allowed in each period.`,
+          conflictingBookings: [],
         };
       }
 

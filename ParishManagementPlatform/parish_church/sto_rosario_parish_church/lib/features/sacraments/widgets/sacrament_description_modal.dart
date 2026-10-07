@@ -29,6 +29,7 @@ class SacramentDescriptionModal extends StatefulWidget {
 class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
   int? _userAge;
   bool _isLoading = true;
+  bool _isDescriptionLoading = true;
   String? _ageEligibilityError;
   String? _databaseDescriptionEnglish;
   String? _databaseDescriptionTagalog;
@@ -43,46 +44,52 @@ class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
   }
 
   Future<void> _loadBookingFormDefinition() async {
-    final data = await FirebaseService.instance.getBookingFormDefinition(
-      widget.sacramentType.bookingFormKey,
-    );
-    if (!mounted || data == null) return;
+    try {
+      final data = await FirebaseService.instance.getBookingFormDefinition(
+        widget.sacramentType.bookingFormKey,
+      );
+      if (mounted && data != null) {
+        final descriptions = data['descriptions'] is Map
+            ? Map<String, dynamic>.from(data['descriptions'] as Map)
+            : const <String, dynamic>{};
+        final description = data['description'];
+        final localizedDescription = description is Map
+            ? Map<String, dynamic>.from(description)
+            : const <String, dynamic>{};
+        final reminders = data['reminders'] is Map
+            ? Map<String, dynamic>.from(data['reminders'] as Map)
+            : const <String, dynamic>{};
 
-    final descriptions = data['descriptions'] is Map
-        ? Map<String, dynamic>.from(data['descriptions'] as Map)
-        : const <String, dynamic>{};
-    final description = data['description'];
-    final localizedDescription = description is Map
-        ? Map<String, dynamic>.from(description)
-        : const <String, dynamic>{};
-    final reminders = data['reminders'] is Map
-        ? Map<String, dynamic>.from(data['reminders'] as Map)
-        : const <String, dynamic>{};
+        List<String> parseList(dynamic value) {
+          if (value is! List) return const [];
+          return value
+              .map((item) => item?.toString().trim() ?? '')
+              .where((item) => item.isNotEmpty)
+              .toList(growable: false);
+        }
 
-    List<String> parseList(dynamic value) {
-      if (value is! List) return const [];
-      return value
-          .map((item) => item?.toString().trim() ?? '')
-          .where((item) => item.isNotEmpty)
-          .toList(growable: false);
+        setState(() {
+          _databaseDescriptionEnglish =
+              (descriptions['english'] ??
+                      localizedDescription['english'] ??
+                      data['descriptionEnglish'] ??
+                      (description is String ? description : null))
+                  ?.toString();
+          _databaseDescriptionTagalog =
+              (descriptions['tagalog'] ??
+                      localizedDescription['tagalog'] ??
+                      data['descriptionTagalog'] ??
+                      (description is String ? description : null))
+                  ?.toString();
+          _databaseReminderEnglish = parseList(reminders['english']);
+          _databaseReminderTagalog = parseList(reminders['tagalog']);
+        });
+      }
+    } catch (error) {
+      debugPrint('Failed to load booking form description: $error');
+    } finally {
+      if (mounted) setState(() => _isDescriptionLoading = false);
     }
-
-    setState(() {
-      _databaseDescriptionEnglish =
-          (descriptions['english'] ??
-                  localizedDescription['english'] ??
-                  data['descriptionEnglish'] ??
-                  (description is String ? description : null))
-              ?.toString();
-      _databaseDescriptionTagalog =
-          (descriptions['tagalog'] ??
-                  localizedDescription['tagalog'] ??
-                  data['descriptionTagalog'] ??
-                  (description is String ? description : null))
-              ?.toString();
-      _databaseReminderEnglish = parseList(reminders['english']);
-      _databaseReminderTagalog = parseList(reminders['tagalog']);
-    });
   }
 
   int _calculateAge(DateTime birthday) {
@@ -330,14 +337,20 @@ class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
                   ),
                 ),
                 SizedBox(height: isMobile ? 8 : 12),
-                Text(
-                  _descriptionText(),
-                  style: TextStyle(
-                    fontSize: isMobile ? 14 : 15,
-                    height: 1.5,
-                    color: Colors.black87,
+                if (_isDescriptionLoading)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 12),
+                    child: Center(child: CircularProgressIndicator()),
+                  )
+                else
+                  Text(
+                    _descriptionText(),
+                    style: TextStyle(
+                      fontSize: isMobile ? 14 : 15,
+                      height: 1.5,
+                      color: Colors.black87,
+                    ),
                   ),
-                ),
                 SizedBox(height: isMobile ? 20 : 24),
 
                 // Reminders Section
@@ -433,6 +446,8 @@ class _SacramentDescriptionModalState extends State<SacramentDescriptionModal> {
         return ParishGradients.massIntentionGradient;
       case SacramentType.firstCommunion:
         return ParishGradients.firstCommunionGradient;
+      case SacramentType.renewalOfVows:
+        return ParishGradients.weddingGradient;
     }
   }
 

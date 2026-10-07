@@ -78,6 +78,7 @@ enum SacramentType {
   anointing,
   massIntention,
   firstCommunion,
+  renewalOfVows,
 }
 
 extension SacramentTypeExtension on SacramentType {
@@ -99,6 +100,8 @@ extension SacramentTypeExtension on SacramentType {
         return isTagalog ? 'Intensyon ng Misa' : 'Mass Intention';
       case SacramentType.firstCommunion:
         return isTagalog ? 'Unang Komunyon' : 'First Communion';
+      case SacramentType.renewalOfVows:
+        return isTagalog ? 'Pagpapanibago ng Panata' : 'Renewal of Vows';
     }
   }
 
@@ -120,6 +123,8 @@ extension SacramentTypeExtension on SacramentType {
         return 'lib/imgs/intensyonsamisa.png';
       case SacramentType.firstCommunion:
         return 'lib/imgs/firstcommunion.png';
+      case SacramentType.renewalOfVows:
+        return 'lib/imgs/kasal.png';
     }
   }
 
@@ -146,6 +151,8 @@ extension SacramentTypeBookingFormKey on SacramentType {
         return 'mass_intention';
       case SacramentType.firstCommunion:
         return 'first_communion';
+      case SacramentType.renewalOfVows:
+        return 'renewal_of_vows';
     }
   }
 }
@@ -534,6 +541,12 @@ class SacramentFormData {
           ],
           requirements: [],
         );
+      case SacramentType.renewalOfVows:
+        return const SacramentFormData(
+          title: 'Renewal of Vows',
+          fields: [],
+          requirements: [],
+        );
     }
   }
 }
@@ -554,6 +567,22 @@ class SacramentFormScreen extends StatefulWidget {
   State<SacramentFormScreen> createState() => _SacramentFormScreenState();
 }
 
+class _ServicePaymentOption {
+  final String id;
+  final String label;
+  final double amount;
+  final String description;
+  final bool isAddon;
+
+  const _ServicePaymentOption({
+    required this.id,
+    required this.label,
+    required this.amount,
+    this.description = '',
+    this.isAddon = false,
+  });
+}
+
 class _SacramentFormScreenState extends State<SacramentFormScreen> {
   _SacramentFormScreenState(); // Add explicit constructor
 
@@ -569,6 +598,12 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   Future<void>? _bookingCountsLoadFuture;
   bool _bookingCountsLoaded = false;
   bool _isSubmitting = false;
+  bool _paymentOptionsLoading = false;
+  String? _paymentOptionsError;
+  List<_ServicePaymentOption> _paymentOptions = const [];
+  _ServicePaymentOption? _selectedPaymentOption;
+  final Set<String> _selectedFeeAddonIds = {};
+  bool _paymentOptionChosen = false;
   bool _formDefinitionLoading = true;
   String? _formDefinitionError;
   bool _isSundayBaptismDate = false;
@@ -581,6 +616,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   final List<Map<String, TextEditingController>> _additionalGodparents = [];
   final Map<int, PlatformFile?> _uploadedRequirementImages =
       {}; // Track uploaded images per requirement
+  final Set<int> _requirementsToFollow = {};
   final Map<int, DocumentValidationResult> _validationResults = {};
   final Map<int, bool> _isValidatingDocuments = {};
   final Map<String, Map<String, String>> _existingCertificateCopies = {};
@@ -602,7 +638,14 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     _controllers = {};
     _dropdownValues = {};
     _loadBookingFormDefinition();
-    _loadExistingCertificateCopies();
+    if (_usesDatabasePaymentOptions) {
+      _loadServicePaymentOptions();
+    } else {
+      _paymentOptionChosen = true;
+    }
+    if (widget.sacramentType != SacramentType.wedding) {
+      _loadExistingCertificateCopies();
+    }
     _loadUserAge();
     _loadCurrentParishPriest();
     // Pre-load booking counts for calendar (except Mass Intention)
@@ -1100,13 +1143,17 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       SacramentType.massIntention,
       SacramentType.anointing,
       SacramentType.funeral,
+      SacramentType.confirmation,
+      SacramentType.firstCommunion,
     }.contains(widget.sacramentType);
   }
 
   bool _isSelectableSameDayAmPmBookingDate(DateTime d) {
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
-    final earliestAllowedDate = today.add(const Duration(days: 2));
+    final minimumLeadDays =
+        widget.sacramentType == SacramentType.wedding ? 21 : 2;
+    final earliestAllowedDate = today.add(Duration(days: minimumLeadDays));
     final day = DateTime(d.year, d.month, d.day);
 
     // Check basic criteria
@@ -1193,7 +1240,9 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     );
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
-    final earliestAllowedDate = today.add(const Duration(days: 2));
+    final minimumLeadDays =
+        widget.sacramentType == SacramentType.wedding ? 21 : 2;
+    final earliestAllowedDate = today.add(Duration(days: minimumLeadDays));
 
     if (requestedDate.isBefore(today)) {
       return widget.isTagalog
@@ -1212,8 +1261,12 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         enforceLeadTime &&
         requestedDate.isBefore(earliestAllowedDate)) {
       return widget.isTagalog
-          ? 'Hindi available ang napiling petsa. Kailangan ang booking ay hindi bababa sa 2 araw mula ngayon.'
-          : 'The selected date is not available. Bookings must be at least 2 days from today.';
+          ? widget.sacramentType == SacramentType.wedding
+                ? 'Hindi available ang petsa. Ang kasal ay kailangang i-book nang hindi bababa sa 3 linggo mula ngayon.'
+                : 'Hindi available ang napiling petsa. Kailangan ang booking ay hindi bababa sa 2 araw mula ngayon.'
+          : widget.sacramentType == SacramentType.wedding
+                ? 'Wedding dates must be booked at least 3 weeks from today.'
+                : 'The selected date is not available. Bookings must be at least 2 days from today.';
     }
 
     if (_isFullyBookedDate(requestedDate)) {
@@ -1250,8 +1303,16 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         'Date of First Communion',
         'First Communion Date',
       ],
+      SacramentType.renewalOfVows => _data.fields
+          .where((field) {
+            final value = field.toLowerCase();
+            return (value.contains('date') || value.contains('petsa')) &&
+                !value.contains('birth') &&
+                !value.contains('kapanganakan');
+          })
+          .toList(growable: false),
     };
-    return {...keys, ..._databaseFieldKeys('date')}.toList(growable: false);
+    return {..._databaseFieldKeys('date'), ...keys}.toList(growable: false);
   }
 
   String _selectedScheduleTime() {
@@ -1268,9 +1329,15 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         'Time of First Communion',
         'First Communion Time',
       ],
+      SacramentType.renewalOfVows => _data.fields
+          .where((field) {
+            final value = field.toLowerCase();
+            return value.contains('time') || value.contains('oras');
+          })
+          .toList(growable: false),
     };
 
-    keys.addAll(_databaseFieldKeys('time'));
+    keys.insertAll(0, _databaseFieldKeys('time'));
 
     for (final key in keys) {
       final value = _controllers[key]?.text.trim() ?? '';
@@ -1294,18 +1361,206 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         'Time of First Communion',
         'First Communion Time',
       ],
+      SacramentType.renewalOfVows => _data.fields
+          .where((field) {
+            final value = field.toLowerCase();
+            return value.contains('time') || value.contains('oras');
+          })
+          .toList(growable: false),
     };
-    return {...keys, ..._databaseFieldKeys('time')}.toList(growable: false);
+    return {..._databaseFieldKeys('time'), ...keys}.toList(growable: false);
+  }
+
+  bool get _usesDatabasePaymentOptions =>
+      widget.sacramentType == SacramentType.baptism ||
+      widget.sacramentType == SacramentType.wedding;
+
+  double get _selectedPaymentTotal {
+    final base = _selectedPaymentOption?.amount ?? 0;
+    return base + _paymentOptions
+        .where((fee) => fee.isAddon && _selectedFeeAddonIds.contains(fee.id))
+        .fold<double>(0, (total, fee) => total + fee.amount);
+  }
+
+  String get _selectedPaymentLabel {
+    final labels = <String>[
+      if (_selectedPaymentOption != null) _selectedPaymentOption!.label,
+      ..._paymentOptions
+          .where((fee) => fee.isAddon && _selectedFeeAddonIds.contains(fee.id))
+          .map((fee) => fee.label),
+    ];
+    return labels.join(' + ');
+  }
+
+  Future<void> _loadServicePaymentOptions() async {
+    if (mounted) {
+      setState(() {
+        _paymentOptionsLoading = true;
+        _paymentOptionsError = null;
+      });
+    }
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('service_fees')
+          .get();
+      final matchingDocs = snapshot.docs.where((doc) {
+        final data = doc.data();
+        final requestedId = widget.sacramentType == SacramentType.baptism
+            ? 'baptism'
+            : 'wedding';
+        final documentId = (data['id'] ?? doc.id)
+            .toString()
+            .toLowerCase()
+            .replaceAll(RegExp(r'[^a-z]'), '');
+        return documentId == requestedId;
+      });
+
+      final options = <_ServicePaymentOption>[];
+      double? parseAmount(dynamic value) => value is num
+          ? value.toDouble()
+          : double.tryParse(value?.toString() ?? '');
+
+      String includesText(dynamic value) => value is List
+          ? value.map((item) => item.toString()).join(', ')
+          : '';
+
+      final selectedService = matchingDocs.isEmpty
+          ? null
+          : matchingDocs.first.data();
+      if (selectedService != null &&
+          widget.sacramentType == SacramentType.baptism) {
+        final packages = selectedService['packages'];
+        if (packages is Map) {
+          for (final entry in packages.entries) {
+            if (entry.value is! Map) continue;
+            final package = Map<String, dynamic>.from(entry.value as Map);
+            final amount = parseAmount(package['amount']);
+            if (amount == null || amount <= 0) continue;
+            options.add(_ServicePaymentOption(
+              id: (package['id'] ?? entry.key).toString(),
+              label: (package['label'] ?? entry.key).toString(),
+              amount: amount,
+              description: includesText(package['includes']),
+            ));
+          }
+        }
+      } else if (selectedService != null &&
+          widget.sacramentType == SacramentType.wedding) {
+        final baseAmount = parseAmount(selectedService['baseAmount']);
+        if (baseAmount != null && baseAmount > 0) {
+          options.add(_ServicePaymentOption(
+            id: 'base',
+            label: widget.isTagalog ? 'Pangunahing bayad sa Kasal' : 'Wedding base fee',
+            amount: baseAmount,
+          ));
+        }
+        final addons = selectedService['addons'];
+        if (addons is Map) {
+          for (final entry in addons.entries) {
+            if (entry.value is! Map) continue;
+            final addon = Map<String, dynamic>.from(entry.value as Map);
+            final amount = parseAmount(addon['amount']);
+            if (amount == null || amount <= 0) continue;
+            options.add(_ServicePaymentOption(
+              id: (addon['id'] ?? entry.key).toString(),
+              label: (addon['label'] ?? entry.key).toString(),
+              amount: amount,
+              isAddon: true,
+            ));
+          }
+        }
+      }
+      final uniqueOptions = <String, _ServicePaymentOption>{};
+      for (final option in options) {
+        uniqueOptions.putIfAbsent(option.id, () => option);
+      }
+      final loadedOptions = uniqueOptions.values.toList();
+      _ServicePaymentOption? weddingBaseOption;
+      if (widget.sacramentType == SacramentType.wedding) {
+        for (final option in loadedOptions) {
+          if (!option.isAddon) {
+            weddingBaseOption = option;
+            break;
+          }
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _paymentOptions = loadedOptions;
+        _selectedPaymentOption = widget.sacramentType == SacramentType.wedding
+            ? weddingBaseOption
+            : null;
+        _selectedFeeAddonIds.clear();
+        _paymentOptionsError = _paymentOptions.isEmpty
+            ? (widget.isTagalog
+                ? 'Walang fees na naka-set sa database para sa serbisyong ito.'
+                : 'No fees are configured in service_fees for this service.')
+            : null;
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(() => _paymentOptionsError =
+            'Unable to load payment options: $error');
+      }
+    } finally {
+      if (mounted) setState(() => _paymentOptionsLoading = false);
+    }
   }
 
   List<String> _databaseFieldKeys(String fieldType) {
-    return _data.fields.where((field) {
+    final configuredFieldKeys = _data.schedules[
+      fieldType == 'date' ? 'dateFieldKeys' : 'timeFieldKeys'
+    ];
+    final configuredNames = configuredFieldKeys is List
+        ? configuredFieldKeys.map((value) => value.toString().trim()).toList()
+        : const <String>[];
+
+    String normalize(String value) =>
+        value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+    final configuredMatches = <String>[];
+    for (final configuredName in configuredNames) {
+      final normalizedName = normalize(configuredName);
+      for (final field in _data.fields) {
+        if (normalize(field) == normalizedName &&
+            !configuredMatches.contains(field)) {
+          configuredMatches.add(field);
+        }
+      }
+    }
+
+    final inferredFields = _data.fields.where((field) {
       final type = (_data.fieldDefinitions[field]?['type'] ?? '')
           .toString()
           .toLowerCase();
-      final normalized = field.toLowerCase();
-      return type == fieldType || normalized.contains(fieldType);
+      final normalized =
+          '$field ${_data.fieldDefinitions[field]?['label'] ?? ''}'
+              .toLowerCase();
+      if (fieldType == 'date' &&
+          (normalized.contains('birth') || normalized.contains('kapanganakan'))) {
+        return false;
+      }
+      if (fieldType == 'date' &&
+          widget.sacramentType == SacramentType.confirmation &&
+          (normalized.contains('baptiz') || normalized.contains('binyag'))) {
+        return false;
+      }
+      if (widget.sacramentType == SacramentType.baptism) {
+        final isBaptismScheduleField =
+            normalized.contains('baptism') ||
+            normalized.contains('binyag') ||
+            normalized.contains('registration') ||
+            (fieldType == 'time' && normalized.trim() == 'time');
+        if (!isBaptismScheduleField) return false;
+      }
+      return type == fieldType ||
+          normalized.contains(fieldType) ||
+          (fieldType == 'date' && normalized.contains('petsa')) ||
+          (fieldType == 'time' && normalized.contains('oras'));
     }).toList(growable: false);
+    return [...configuredMatches, ...inferredFields]
+        .toSet()
+        .toList(growable: false);
   }
 
   void _clearSelectedScheduleTime() {
@@ -1337,9 +1592,76 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         return;
       }
 
+      final configuredFields = List<dynamic>.from(rawFields);
+      if (widget.sacramentType == SacramentType.confirmation) {
+        final hasConfirmationDateField = configuredFields.any((rawField) {
+          if (rawField is! Map) return false;
+          final definition = Map<String, dynamic>.from(rawField);
+          if (definition['visible'] == false) return false;
+          final identity = '${definition['name'] ?? definition['key'] ?? ''} '
+                  '${definition['label'] ?? ''}'
+              .toLowerCase();
+          return (identity.contains('date') || identity.contains('petsa')) &&
+              (identity.contains('confirmation') ||
+                  identity.contains('kumpil'));
+        });
+        if (!hasConfirmationDateField) {
+          configuredFields.add({
+            'name': 'Date of Confirmation (Petsa ng Kumpil)',
+            'label': 'Date of Confirmation (Petsa ng Kumpil)',
+            'type': 'date',
+            'required': true,
+            'visible': true,
+            'section': 'Confirmation Schedule',
+          });
+        }
+
+        final scheduledTime = data['scheduledTime']?.toString().trim() ?? '';
+        if (scheduledTime.isNotEmpty) {
+          final timeFieldIndex = configuredFields.indexWhere((rawField) {
+            if (rawField is! Map) return false;
+            final definition = Map<String, dynamic>.from(rawField);
+            if (definition['visible'] == false) return false;
+            final identity = '${definition['name'] ?? definition['key'] ?? ''} '
+                    '${definition['label'] ?? ''}'
+                .toLowerCase();
+            final type = (definition['type'] ?? '').toString().toLowerCase();
+            return type == 'time' ||
+                identity.contains('time') ||
+                identity.contains('oras');
+          });
+
+          if (timeFieldIndex == -1) {
+            configuredFields.add({
+              'name': 'Time (Oras)',
+              'label': 'Time (Oras)',
+              'type': 'time',
+              'options': [scheduledTime],
+              'required': true,
+              'visible': true,
+              'section': 'Confirmation Schedule',
+            });
+          } else {
+            final definition = Map<String, dynamic>.from(
+              configuredFields[timeFieldIndex] as Map,
+            );
+            final options = definition['options'] is List
+                ? List<dynamic>.from(definition['options'] as List)
+                : <dynamic>[];
+            if (!options.any(
+              (option) => option.toString().trim() == scheduledTime,
+            )) {
+              options.add(scheduledTime);
+            }
+            definition['options'] = options;
+            configuredFields[timeFieldIndex] = definition;
+          }
+        }
+      }
+
       final fields = <String>[];
       final fieldDefinitions = <String, Map<String, dynamic>>{};
-      for (final rawField in rawFields) {
+      for (final rawField in configuredFields) {
         if (rawField is Map) {
           final definition = Map<String, dynamic>.from(rawField);
           if (definition['visible'] == false) continue;
@@ -1410,6 +1732,30 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         _controllers.putIfAbsent(field, TextEditingController.new);
       }
     });
+
+    if (widget.sacramentType == SacramentType.confirmation) {
+      final scheduledDate = data['scheduledDate']?.toString().trim() ?? '';
+      final dateKey = _selectedScheduleDateKeys().firstWhere(
+        _controllers.containsKey,
+        orElse: () => 'Date of Confirmation (Petsa ng Kumpil)',
+      );
+      if (scheduledDate.isNotEmpty &&
+          (_controllers[dateKey]?.text.trim().isEmpty ?? true)) {
+        _controllers[dateKey]?.text = scheduledDate;
+      }
+
+      final scheduledTime = data['scheduledTime']?.toString().trim() ?? '';
+      final parsedScheduledTime = _parseTimeOfDay(scheduledTime);
+      final timeKey = _selectedScheduleTimeKeys().firstWhere(
+        _controllers.containsKey,
+        orElse: () => 'Time (Oras)',
+      );
+      if (parsedScheduledTime != null &&
+          (_controllers[timeKey]?.text.trim().isEmpty ?? true)) {
+        _controllers[timeKey]?.text = _formatTimeOfDay(parsedScheduledTime);
+      }
+
+    }
     } catch (error) {
       debugPrint('Failed to load booking form definition: $error');
       if (mounted) {
@@ -1572,6 +1918,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           setState(() {
             _uploadedRequirementImages[requirementIndex] = platformFile;
             _validationResults[requirementIndex] = validationResult;
+            _requirementsToFollow.remove(requirementIndex);
           });
 
           final didAutoFill = await _reviewAndAutoFillOcrData(
@@ -1914,8 +2261,9 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           );
         }
       } else {
-        final certificateType =
-            _certificateTypeForRequirement(_data.requirements[i]);
+        final certificateType = widget.sacramentType == SacramentType.wedding
+            ? null
+            : _certificateTypeForRequirement(_data.requirements[i]);
         final existingCertificate = certificateType == null
             ? null
             : _existingCertificateCopies[certificateType];
@@ -1953,6 +2301,93 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     print('DEBUG: Finished saving all requirements');
   }
 
+  List<Map<String, dynamic>> _requirementSubmissionStatuses() {
+    final weddingDate = widget.sacramentType == SacramentType.wedding
+        ? _parseDateString(_selectedScheduleDate())
+        : null;
+    final dueDate = weddingDate?.subtract(const Duration(days: 7));
+
+    return _data.requirements.asMap().entries
+        .where((entry) =>
+            !entry.value.contains('Requirements:') &&
+            !entry.value.contains('Kinakailangan:'))
+        .map((entry) {
+          final index = entry.key;
+          final certificateType = widget.sacramentType == SacramentType.wedding
+              ? null
+              : _certificateTypeForRequirement(entry.value);
+          final hasParishCertificate = certificateType != null &&
+              _existingCertificateCopies.containsKey(certificateType);
+          final status = _uploadedRequirementImages[index] != null
+              ? 'uploaded'
+              : hasParishCertificate
+                  ? 'on_file'
+                  : _requirementsToFollow.contains(index)
+                      ? 'to_follow'
+                      : 'pending';
+          return <String, dynamic>{
+            'name': entry.value,
+            'status': status,
+            if (status == 'to_follow' && dueDate != null)
+              'dueDate': '${dueDate.year.toString().padLeft(4, '0')}-'
+                  '${dueDate.month.toString().padLeft(2, '0')}-'
+                  '${dueDate.day.toString().padLeft(2, '0')}',
+          };
+        })
+        .toList(growable: false);
+  }
+
+  bool _hasWeddingParentInfoFor(String party) {
+    final partyTerms = party == 'groom'
+        ? const ['groom', 'husband', 'lalaki']
+        : const ['bride', 'wife', 'babae'];
+    const parentRoleTerms = ['father', 'mother', 'ama', 'ina'];
+    final sectionsByField = <String, String>{};
+    var activeSection = 'FORM INFORMATION';
+    for (final field in _data.fields) {
+      if (field.startsWith('[SECTION]')) {
+        activeSection = field.replaceFirst('[SECTION]', '').trim();
+        continue;
+      }
+      final section = _data.fieldDefinitions[field]?['section']
+              ?.toString()
+              .trim() ??
+          '';
+      if (section.isNotEmpty) activeSection = section;
+      sectionsByField[field] = activeSection;
+    }
+
+    for (final entry in _controllers.entries) {
+      if (entry.value.text.trim().isEmpty) continue;
+
+      final definition = _data.fieldDefinitions[entry.key] ?? const {};
+      final searchableText = [
+        entry.key,
+        definition['label']?.toString() ?? '',
+        definition['section']?.toString() ?? '',
+        sectionsByField[entry.key] ?? '',
+      ].join(' ').toLowerCase();
+      final hasParty =
+          partyTerms.any((term) => searchableText.contains(term));
+      final hasParentRole =
+          parentRoleTerms.any((term) => searchableText.contains(term));
+      final hasNamedParentField = searchableText.contains('parent') &&
+          (searchableText.contains('name') ||
+              searchableText.contains('pangalan'));
+
+      if (hasParty && (hasParentRole || hasNamedParentField)) return true;
+    }
+
+    // Keep compatibility with the app's original Wedding field keys in case
+    // a form definition omits party or parent labels from its metadata.
+    final parentKeys = party == 'groom'
+        ? const ['Groom Father Name', 'Groom Mother Name']
+        : const ['Bride Father Name', 'Bride Mother Name'];
+    return parentKeys.any(
+      (key) => (_controllers[key]?.text.trim().isNotEmpty ?? false),
+    );
+  }
+
   Future<void> _submitForm() async {
     if (FirebaseService.instance.currentUid.isEmpty) {
       _showModalNotificationGlobal(
@@ -1971,24 +2406,40 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     setState(() => _isSubmitting = true);
 
     try {
-      // Parent validation for wedding form
-      if (widget.sacramentType == SacramentType.wedding) {
-        final groomFather =
-            _controllers['Groom Father Name']?.text.trim() ?? '';
-        final groomMother =
-            _controllers['Groom Mother Name']?.text.trim() ?? '';
-        final brideFather =
-            _controllers['Bride Father Name']?.text.trim() ?? '';
-        final brideMother =
-            _controllers['Bride Mother Name']?.text.trim() ?? '';
-
-        if ((groomFather.isEmpty && groomMother.isEmpty) ||
-            (brideFather.isEmpty && brideMother.isEmpty)) {
+      final approvedForm = await FirebaseService.instance
+          .getBookingFormDefinition(widget.sacramentType.bookingFormKey);
+      if (approvedForm == null) {
+        if (mounted) {
+          setState(() {
+            _formDefinitionError =
+                'This form is not currently approved for booking.';
+          });
           _showModalNotificationGlobal(
             context,
             widget.isTagalog
-                ? 'Kailangan ang kahit isang magulang (ama o ina) para sa bawat magkasintahan.'
-                : 'At least one parent (father or mother) is required for both the groom and bride.',
+                ? 'Hindi kasalukuyang aprubado ang form na ito para sa booking.'
+                : 'This form is not currently approved for booking.',
+            bgColor: Colors.red,
+          );
+        }
+        return;
+      }
+
+      // Parent validation for wedding form
+      if (widget.sacramentType == SacramentType.wedding) {
+        final missingParties = [
+          if (!_hasWeddingParentInfoFor('groom'))
+            widget.isTagalog ? 'lalaki' : 'groom',
+          if (!_hasWeddingParentInfoFor('bride'))
+            widget.isTagalog ? 'babae' : 'bride',
+        ];
+
+        if (missingParties.isNotEmpty) {
+          _showModalNotificationGlobal(
+            context,
+            widget.isTagalog
+                ? 'Kailangan ang pangalan ng kahit isang magulang para sa bawat ikakasal. Hindi nakita ang impormasyon para sa: ${missingParties.join(' at ')}.'
+                : 'Enter at least one parent name for both the groom and bride. Parent information was not detected for: ${missingParties.join(' and ')}.',
             bgColor: Colors.red,
           );
           return;
@@ -1997,6 +2448,18 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
 
       final selectedDate = _selectedScheduleDate();
       final selectedTime = _selectedScheduleTime();
+
+      if (widget.sacramentType == SacramentType.confirmation &&
+          (selectedDate.isEmpty || selectedTime.isEmpty)) {
+        _showModalNotificationGlobal(
+          context,
+          widget.isTagalog
+              ? 'Wala pang nakatakdang petsa o oras ng Kumpil sa database. Makipag-ugnayan sa opisina ng parokya.'
+              : 'The Confirmation date or time is not configured in the database. Please contact the parish office.',
+          bgColor: Colors.red,
+        );
+        return;
+      }
 
       if (selectedDate.isNotEmpty) {
         final dateWarningMessage = _bookingDateWarningMessage(
@@ -2014,12 +2477,6 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       }
 
       if (selectedDate.isNotEmpty && selectedTime.isNotEmpty) {
-        final selectedDateTime = DateTime.tryParse(selectedDate);
-        final bool isSundayBaptism =
-            widget.sacramentType == SacramentType.baptism &&
-            selectedDateTime != null &&
-            selectedDateTime.weekday == DateTime.sunday;
-
         if (await _isBlockedByMassSchedule(
           date: selectedDate,
           time: selectedTime,
@@ -2028,8 +2485,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           return;
         }
 
-        if (!isSundayBaptism &&
-            widget.sacramentType != SacramentType.massIntention) {
+        if (widget.sacramentType != SacramentType.massIntention) {
           final cacheKey = 'any|$selectedDate|$selectedTime';
           final cached = _slotTakenCache[cacheKey];
           final isTaken =
@@ -2091,6 +2547,19 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         fieldValues.removeWhere((key, _) => _isDonationArNumberField(key));
       }
 
+      final requirementStatuses = _requirementSubmissionStatuses();
+      if (widget.sacramentType == SacramentType.wedding &&
+          requirementStatuses.any((item) => item['status'] == 'pending')) {
+        _showModalNotificationGlobal(
+          context,
+          widget.isTagalog
+              ? 'Para sa bawat requirement ng kasal, mag-upload ng dokumento o piliin ang “Ipapasa Pa”.'
+              : 'For each wedding requirement, upload the document or select “To Follow”.',
+          bgColor: Colors.red,
+        );
+        return;
+      }
+
       final additionalGodparents = _additionalGodparents
           .map(
             (godparent) => godparent.map(
@@ -2100,42 +2569,70 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           .toList();
 
       try {
-        await FirebaseService.instance.submitBooking(
-          sacramentType: widget.sacramentType.label(widget.isTagalog),
-          details: {
-            'fields': fieldValues,
-            'additionalGodparents': additionalGodparents,
-          },
-        );
+        final bookingDetails = {
+          'fields': fieldValues,
+          'additionalGodparents': additionalGodparents,
+          if (requirementStatuses.isNotEmpty)
+            'requiredDocuments': requirementStatuses,
+        };
+        if (_usesDatabasePaymentOptions) {
+          final option = _selectedPaymentOption;
+          if (option == null) {
+            throw Exception('Choose a fee before submitting.');
+          }
+          final selectedAddons = _paymentOptions
+              .where((fee) => fee.isAddon && _selectedFeeAddonIds.contains(fee.id))
+              .toList(growable: false);
+          final totalAmount = option.amount + selectedAddons.fold<double>(
+            0,
+            (total, addon) => total + addon.amount,
+          );
+          final addonBreakdown = selectedAddons
+              .map((addon) => {
+                    'id': addon.id,
+                    'name': addon.label,
+                    'price': addon.amount,
+                  })
+              .toList(growable: false);
+          final feeBreakdown = {
+            'total': totalAmount,
+            'currency': 'PHP',
+            'paymentOptionId': option.id,
+            'paymentOption': option.label,
+            'baseAmount': option.amount,
+            if (addonBreakdown.isNotEmpty) 'addons': addonBreakdown,
+          };
+          await FirebaseService.instance.submitBooking(
+            sacramentType: widget.sacramentType.label(widget.isTagalog),
+            details: {
+              ...bookingDetails,
+              'paymentOption': {
+                'id': option.id,
+                'label': option.label,
+                'amount': option.amount,
+              },
+              'selectedAddons': addonBreakdown,
+              'totalAmount': totalAmount,
+            },
+            feeBreakdown: feeBreakdown,
+          );
+        } else {
+          await FirebaseService.instance.submitBooking(
+            sacramentType: widget.sacramentType.label(widget.isTagalog),
+            details: bookingDetails,
+          );
+        }
 
         _showModalNotificationGlobal(
           context,
           widget.isTagalog
-              ? '${_data.title} naipadala! Pang hintayin ang aprubasyon ng admin bago magbayad.'
+              ? '${_data.title} naipadala! Hintayin ang aprubasyon ng admin bago magbayad.'
               : '${_data.title} submitted! Please wait for admin approval before proceeding to payment.',
-          bgColor: ParishColors.greenSuccess,
-        );
-
-        // Original booking success alert - show immediately after booking is created
-        _showModalNotificationGlobal(
-          context,
-          widget.isTagalog
-              ? '${_data.title} naipadala!'
-              : '${_data.title} submitted!',
           bgColor: ParishColors.greenSuccess,
         );
 
         // Save all uploaded requirements after successful booking creation
         await _saveAllRequirements();
-
-        // Additional alert for requirements being saved
-        _showModalNotificationGlobal(
-          context,
-          widget.isTagalog
-              ? 'Ang mga requirements ay nai-save na.'
-              : 'Requirements have been saved.',
-          bgColor: ParishColors.greenSuccess,
-        );
 
         // Reset form after submit
         _formKey.currentState!.reset();
@@ -2146,6 +2643,13 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           for (final controller in godparent.values) {
             controller.clear();
           }
+        }
+        if (mounted) {
+          setState(() {
+            _uploadedRequirementImages.clear();
+            _validationResults.clear();
+            _requirementsToFollow.clear();
+          });
         }
       } catch (e) {
         // Enhanced error handling to show scheduling conflict errors clearly
@@ -2197,6 +2701,50 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     }
   }
 
+  Widget _buildRequirementReminder() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.amber.shade50,
+        border: Border.all(color: Colors.amber.shade300),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Text.rich(
+        TextSpan(
+          style: const TextStyle(
+            fontSize: 13,
+            height: 1.35,
+            color: Colors.black87,
+          ),
+          children: const [
+            TextSpan(
+              text: 'Reminder: ',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            TextSpan(
+              text: 'Please submit all required documents, including their hardcopies, to the parish office at least ',
+            ),
+            TextSpan(
+              text: 'one week before the scheduled sacrament',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            TextSpan(text: '. Uploading the documents through the app '),
+            TextSpan(
+              text: 'does not',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            TextSpan(text: ' replace the submission of their hardcopies. '),
+            TextSpan(
+              text: 'All required hardcopy documents must still be submitted to the parish office.',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildRequirementItem(String requirement, int index) {
     // Check if this is a separator/header (Groom Requirements: or Bride Requirements:)
     final isSeparator =
@@ -2229,7 +2777,9 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     }
 
     // Reuse a matching issued certificate from this parishioner's own records.
-    final certificateType = _certificateTypeForRequirement(requirement);
+    final certificateType = widget.sacramentType == SacramentType.wedding
+        ? null
+        : _certificateTypeForRequirement(requirement);
     final existingCertificate = certificateType == null
         ? null
         : _existingCertificateCopies[certificateType];
@@ -2244,7 +2794,9 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     final validationResult = _validationResults[index];
     final fileName = isUploaded
         ? file!.name
-        : (widget.isTagalog ? 'Walang file na napili' : 'No file selected');
+        : _requirementsToFollow.contains(index)
+            ? (widget.isTagalog ? 'Ipapasa bago ang takdang araw' : 'Marked to follow')
+            : (widget.isTagalog ? 'Walang file na napili' : 'No file selected');
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12.0),
@@ -2324,6 +2876,30 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                   ),
                 ),
                 const SizedBox(width: 12),
+                if (!isSatisfiedByParishRecord &&
+                    !isUploaded &&
+                    widget.sacramentType == SacramentType.wedding)
+                    OutlinedButton(
+                      onPressed: isValidating
+                          ? null
+                          : () => setState(() {
+                              if (!_requirementsToFollow.remove(index)) {
+                                _requirementsToFollow.add(index);
+                              }
+                            }),
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 9,
+                        ),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                      child: Text(
+                        _requirementsToFollow.contains(index)
+                            ? (widget.isTagalog ? 'Pipiliin' : 'To Follow ✓')
+                            : (widget.isTagalog ? 'Ipapasa Pa' : 'To Follow'),
+                      ),
+                    ),
                 if (!isSatisfiedByParishRecord)
                   ElevatedButton.icon(
                   onPressed: isValidating || isCheckingParishRecords
@@ -2339,15 +2915,15 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                           isUploaded ? Icons.edit : Icons.upload_file,
                           size: 18,
                         ),
-                  label: Text(
-                    isValidating
+                    label: Text(
+                      isValidating
                         ? (widget.isTagalog
                               ? 'Nagva-Validate...'
                               : 'Validating...')
                         : isUploaded
                         ? (widget.isTagalog ? 'Baguhin' : 'Edit')
                         : (widget.isTagalog ? 'Upload' : 'Upload'),
-                  ),
+                    ),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: isValidating
                         ? Colors.grey
@@ -2705,13 +3281,18 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     // parish services and sacraments use the shared date-specific slots.
     final usesStandardBookingSlots =
         widget.sacramentType != SacramentType.massIntention;
+    final isMassIntention =
+        widget.sacramentType == SacramentType.massIntention;
     final selectedDate = _selectedScheduleDate();
-    final baseAllowedTimes = allowedTimes ??
-        (usesStandardBookingSlots ? _standardBookingTimeSlots() : null);
+    final baseAllowedTimes = isMassIntention
+        ? _massIntentionAllowedTimesForSelectedDate()
+        : allowedTimes ??
+              (usesStandardBookingSlots ? _standardBookingTimeSlots() : null);
     final availableStandardSlots = selectedDate.isEmpty
         ? const <String>[]
         : _availableStandardSlotsByDate[selectedDate] ?? const <String>[];
-    final effectiveAllowedTimes = !usesStandardBookingSlots || baseAllowedTimes == null
+    final effectiveAllowedTimes = !usesStandardBookingSlots ||
+            baseAllowedTimes == null
         ? baseAllowedTimes
         : baseAllowedTimes
             .where(
@@ -2722,7 +3303,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         selectedDate.isNotEmpty &&
         _standardSlotAvailabilityLoadingDates.contains(selectedDate);
 
-    if (dropdownOnly || effectiveAllowedTimes != null) {
+    if (dropdownOnly || isMassIntention || effectiveAllowedTimes != null) {
       final allowedValues = (effectiveAllowedTimes ?? const <TimeOfDay>[])
           .map(_formatTimeOfDay)
           .toList();
@@ -2757,7 +3338,10 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           items: allowedValues.map((option) {
             return DropdownMenuItem<String>(value: option, child: Text(option));
           }).toList(),
-          onChanged: disabled || allowedValues.isEmpty
+          onChanged: disabled ||
+                  (isMassIntention &&
+                      (selectedDate.isEmpty || _massScheduleLoading)) ||
+                  allowedValues.isEmpty
               ? null
               : (value) async {
                   if (value == null) return;
@@ -3296,8 +3880,10 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
     final firstMonthDay = DateTime(year, month);
+    final minimumLeadDays =
+        widget.sacramentType == SacramentType.wedding ? 21 : 2;
     final firstAllowedDay = enforceLeadTime
-        ? today.add(const Duration(days: 2))
+        ? today.add(Duration(days: minimumLeadDays))
         : today;
     final searchStart = firstMonthDay.isBefore(firstAllowedDay)
         ? firstAllowedDay
@@ -4276,24 +4862,49 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     final dateStr =
         '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
     try {
-      final snapshot = await FirebaseFirestore.instance
-          .collection('mass_schedules')
-          .where('date', isEqualTo: dateStr)
-          .get();
-
       final massTimes = <TimeOfDay>[];
-      for (final doc in snapshot.docs) {
-        final data = doc.data();
-        final rawTime = (data['time'] ?? data['timeString'] ?? '').toString();
-        final time = _parseTimeOfDay(rawTime);
-        if (time != null) {
-          massTimes.add(time);
+      for (final collection in ['mass_schedules', 'massSchedules']) {
+        try {
+          final snapshot = await FirebaseFirestore.instance
+              .collection(collection)
+              .where('date', isEqualTo: dateStr)
+              .get();
+          for (final doc in snapshot.docs) {
+            final data = doc.data();
+            if (data['active'] == false) continue;
+            final rawTime =
+                (data['time'] ?? data['timeString'] ?? data['startTime'] ?? '')
+                    .toString();
+            final time = _parseTimeOfDay(rawTime);
+            if (time != null) massTimes.add(time);
+          }
+        } catch (error) {
+          debugPrint('Could not load Sunday baptism times from $collection: $error');
         }
       }
 
       if (massTimes.isEmpty) {
-        return null;
+        final profile = await FirebaseFirestore.instance
+            .collection('parish_profile')
+            .doc('main')
+            .get();
+        if (profile.exists) {
+          final scheduleTexts = _massScheduleTextsFromProfileData(
+            profile.data() ?? const <String, dynamic>{},
+          );
+          for (final text in scheduleTexts) {
+            final normalized = text.toLowerCase();
+            if (!normalized.contains('sunday') &&
+                !normalized.contains('linggo')) {
+              continue;
+            }
+            final time = _parseTimeOfDay(text);
+            if (time != null) massTimes.add(time);
+          }
+        }
       }
+
+      if (massTimes.isEmpty) return null;
 
       massTimes.sort((a, b) {
         final aMinutes = a.hour * 60 + a.minute;
@@ -4302,9 +4913,11 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       });
 
       final firstMass = massTimes.first;
+      final nextHourMinutes = firstMass.hour * 60 + firstMass.minute + 60;
+      if (nextHourMinutes >= 24 * 60) return null;
       final nextHour = TimeOfDay(
-        hour: (firstMass.hour + 1) % 24,
-        minute: firstMass.minute,
+        hour: nextHourMinutes ~/ 60,
+        minute: nextHourMinutes % 60,
       );
       return _formatTimeOfDay(nextHour);
     } catch (_) {
@@ -4313,6 +4926,10 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   }
 
   Future<void> _checkSchedulingConflictOnSelection() async {
+    // Confirmation uses the fixed date and time configured by the parish.
+    // Keep those database values intact; submission validates the fixed slot.
+    if (widget.sacramentType == SacramentType.confirmation) return;
+
     // Find date and time fields for current sacrament type
     String? dateFieldValue;
     String? timeFieldValue;
@@ -4361,6 +4978,10 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       case SacramentType.firstCommunion:
         dateKeys = ['Date of First Communion', 'First Communion Date'];
         timeKeys = ['Time of First Communion', 'First Communion Time'];
+        break;
+      case SacramentType.renewalOfVows:
+        dateKeys = _selectedScheduleDateKeys();
+        timeKeys = _selectedScheduleTimeKeys();
         break;
     }
 
@@ -4446,6 +5067,7 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         if (mounted && result.hasConflict) {
           debugPrint('[CONFLICT CHECK] Showing conflict alert!');
           setState(_clearSelectedScheduleTime);
+          await _refreshStandardSlotAvailability(dateFieldValue);
           // Show alert with the three-line message
           showDialog(
             context: context,
@@ -4637,22 +5259,37 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
               );
               return;
             }
-            if (fieldKey == 'Registration - Date of Baptism') {
+            if (widget.sacramentType == SacramentType.baptism &&
+                _selectedScheduleDateKeys().contains(fieldKey)) {
               final bool sunday = picked.weekday == DateTime.sunday;
               String? sundayTime;
               if (sunday) {
-                sundayTime =
-                    await _loadSundayBaptismTime(picked) ??
-                    _formatTimeOfDay(const TimeOfDay(hour: 9, minute: 0));
+                sundayTime = await _loadSundayBaptismTime(picked);
+                if (sundayTime == null) {
+                  _showModalNotificationGlobal(
+                    context,
+                    widget.isTagalog
+                        ? 'Walang nakatalang Misa para sa Linggong ito. Pumili ng ibang petsa o makipag-ugnayan sa opisina ng parokya.'
+                        : 'No Mass schedule is recorded for this Sunday. Choose another date or contact the parish office.',
+                    bgColor: Colors.red,
+                  );
+                  return;
+                }
               }
               setState(() {
                 _controllers[fieldKey]!.text = selectedDate;
                 _isSundayBaptismDate = sunday;
                 _sundayBaptismTime = sundayTime;
                 // Safely set the time controller without forcing a null
-                _controllers['Registration - Time of Baptism']?.text = (sunday
-                    ? (sundayTime ?? '')
-                    : '');
+                final scheduleTimeField = _selectedScheduleTimeKeys()
+                    .firstWhere(
+                      _data.fields.contains,
+                      orElse: () => 'Registration - Time of Baptism',
+                    );
+                _controllers.putIfAbsent(
+                  scheduleTimeField,
+                  TextEditingController.new,
+                ).text = sunday ? (sundayTime ?? '') : '';
               });
               await _refreshStandardSlotAvailability(selectedDate);
               // Check for scheduling conflicts after date is selected
@@ -4936,6 +5573,108 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       );
     }
 
+    if (_usesDatabasePaymentOptions && !_paymentOptionChosen) {
+      return Scaffold(
+        backgroundColor: ParishColors.bgBlue50,
+        appBar: AppBar(
+          centerTitle: true,
+          title: Text(isTagalog ? 'Pumili ng Bayarin' : 'Choose a Fee'),
+          leading: IconButton(
+            onPressed: () => Navigator.of(context).pop(),
+            icon: const Icon(Icons.close, color: Colors.white),
+          ),
+          backgroundColor: ParishColors.primaryBlue,
+          foregroundColor: Colors.white,
+        ),
+        body: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 560),
+            child: Card(
+              margin: const EdgeInsets.all(20),
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      isTagalog
+                          ? 'Pumili ng bayarin bago punan ang form.'
+                          : 'Choose a fee before filling in the form.',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 16),
+                    if (_paymentOptionsLoading)
+                      const Center(child: CircularProgressIndicator())
+                    else if (_paymentOptionsError != null)
+                      Column(
+                        children: [
+                          Text(
+                            _paymentOptionsError!,
+                            style: const TextStyle(color: Colors.red),
+                          ),
+                          const SizedBox(height: 12),
+                          OutlinedButton.icon(
+                            onPressed: _loadServicePaymentOptions,
+                            icon: const Icon(Icons.refresh),
+                            label: Text(isTagalog ? 'Subukan muli' : 'Retry'),
+                          ),
+                        ],
+                      )
+                    else
+                      ..._paymentOptions.map((option) {
+                        if (option.isAddon) {
+                          final checked = _selectedFeeAddonIds.contains(option.id);
+                          return Card(
+                            child: CheckboxListTile(
+                              value: checked,
+                              onChanged: (value) => setState(() {
+                                if (value == true) {
+                                  _selectedFeeAddonIds.add(option.id);
+                                } else {
+                                  _selectedFeeAddonIds.remove(option.id);
+                                }
+                              }),
+                              title: Text(option.label),
+                              subtitle: Text(
+                                'Add PHP ${option.amount.toStringAsFixed(2)}',
+                              ),
+                            ),
+                          );
+                        }
+                        final selected = _selectedPaymentOption?.id == option.id;
+                        return Card(
+                          color: selected ? Colors.blue.shade50 : Colors.white,
+                          child: RadioListTile<String>(
+                            value: option.id,
+                            groupValue: _selectedPaymentOption?.id,
+                            onChanged: (_) => setState(
+                              () => _selectedPaymentOption = option,
+                            ),
+                            title: Text(option.label),
+                            subtitle: Text(
+                              '₱${option.amount.toStringAsFixed(2)}'
+                              '${option.description.isEmpty ? '' : '\n${option.description}'}',
+                            ),
+                          ),
+                        );
+                      }),
+                    const SizedBox(height: 12),
+                    FilledButton(
+                      onPressed: _selectedPaymentOption == null
+                          ? null
+                          : () => setState(() => _paymentOptionChosen = true),
+                      child: Text(isTagalog ? 'Magpatuloy sa Form' : 'Continue to Form'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
     if (_supportsBookingAssistant() &&
         !_hasShownBookingAssistant &&
         !_massScheduleLoading) {
@@ -5010,6 +5749,23 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      if (_selectedPaymentOption != null) ...[
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(12),
+                          margin: const EdgeInsets.only(bottom: 16),
+                          decoration: BoxDecoration(
+                            color: Colors.blue.shade50,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: Colors.blue.shade200),
+                          ),
+                          child: Text(
+                            '${isTagalog ? 'Napiling bayarin' : 'Selected fees'}: '
+                            '$_selectedPaymentLabel · PHP ${_selectedPaymentTotal.toStringAsFixed(2)}',
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                      ],
                       if (_data.requirements.isNotEmpty) ...[
                         Text(
                           isTagalog
@@ -5017,6 +5773,8 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                               : 'Required Documents / Requirements',
                           style: Theme.of(context).textTheme.titleMedium,
                         ),
+                        const SizedBox(height: 10),
+                        _buildRequirementReminder(),
                         const SizedBox(height: 10),
                         if (widget.sacramentType ==
                                 SacramentType.houseBlessing ||
@@ -5126,6 +5884,14 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   Widget _buildDatabaseDrivenForm(bool isTagalog) {
     final sections = <String, List<Widget>>{};
     var activeSection = isTagalog ? 'IMPORMASYON NG FORM' : 'FORM INFORMATION';
+    var confirmationReminderAdded = false;
+    final confirmationScheduleFields = widget.sacramentType ==
+            SacramentType.confirmation
+        ? {
+            ..._selectedScheduleDateKeys(),
+            ..._selectedScheduleTimeKeys(),
+          }
+        : const <String>{};
 
     for (final field in _data.fields) {
       if (field.startsWith('[SECTION]')) {
@@ -5137,6 +5903,20 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       final definition = _data.fieldDefinitions[field] ?? const {};
       final section = (definition['section'] ?? '').toString().trim();
       if (section.isNotEmpty) activeSection = section;
+
+      if (confirmationScheduleFields.contains(field)) {
+        if (!confirmationReminderAdded) {
+          sections
+              .putIfAbsent(
+                isTagalog ? 'ISKEDYUL NG KUMPIL' : 'CONFIRMATION SCHEDULE',
+                () => <Widget>[],
+              )
+              .add(_buildConfirmationScheduleReminder(isTagalog));
+          confirmationReminderAdded = true;
+        }
+        continue;
+      }
+
       sections
           .putIfAbsent(activeSection, () => <Widget>[])
           .add(_buildDatabaseField(field, definition));
@@ -5152,6 +5932,65 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             ),
           )
           .toList(growable: false),
+    );
+  }
+
+  Widget _buildConfirmationScheduleReminder(bool isTagalog) {
+    final rawDate = _selectedScheduleDate();
+    final parsedDate = _parseDateString(rawDate);
+    final rawTime = _selectedScheduleTime();
+    final parsedTime = _parseTimeOfDay(rawTime);
+    final dateText = parsedDate == null
+        ? (isTagalog ? 'Hindi pa nakatakda' : 'Not scheduled')
+        : MaterialLocalizations.of(context).formatMediumDate(parsedDate);
+    final timeText = parsedTime == null
+        ? (isTagalog ? 'Hindi pa nakatakda' : 'Not scheduled')
+        : _formatTimeOfDay(parsedTime);
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: ParishColors.bgBlue50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: ParishColors.borderBlue100),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.event_available_outlined,
+                color: ParishColors.primaryBlue,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  isTagalog
+                      ? 'Nakatakda na ang iskedyul ng Kumpil.'
+                      : 'The Confirmation schedule is fixed by the parish.',
+                  style: const TextStyle(
+                    color: ParishColors.textBlue900,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            isTagalog ? 'Petsa: $dateText' : 'Date: $dateText',
+            style: const TextStyle(color: ParishColors.textBlue900),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            isTagalog ? 'Oras: $timeText' : 'Time: $timeText',
+            style: const TextStyle(color: ParishColors.textBlue900),
+          ),
+        ],
+      ),
     );
   }
 
@@ -5571,7 +6410,12 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
   }
 
   List<TimeOfDay> _configuredTimeOptions(Map<String, dynamic> definition) {
-    final options = definition['options'];
+    final options = definition['options'] is List
+        ? definition['options']
+        : _data.schedules['timeOptions'] ??
+              _data.schedules['availableTimes'] ??
+              _data.schedules['timeSlots'] ??
+              _data.schedules['recommendedSlots'];
     if (options is! List) return const [];
     final times = <TimeOfDay>[];
     final seen = <int>{};
@@ -5600,7 +6444,12 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     }
     final allSlots = _standardBookingTimeSlots()
         .map(_formatTimeOfDay)
-        .toList();
+        .toSet();
+    if (widget.sacramentType == SacramentType.baptism &&
+        _isSundayBaptismDate) {
+      final sundayTime = _parseTimeOfDay(_sundayBaptismTime ?? '');
+      if (sundayTime != null) allSlots.add(_formatTimeOfDay(sundayTime));
+    }
     if (allSlots.isEmpty) {
       if (mounted) {
         setState(() {
@@ -5616,14 +6465,15 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     try {
       final availableSlots = await FirebaseService.instance.getAvailableTimeSlots(
         date: date,
-        allPossibleTimeSlots: allSlots,
+        allPossibleTimeSlots: allSlots.toList(growable: false),
       );
       if (!mounted || _selectedScheduleDate() != date) return;
 
       setState(() {
         _availableStandardSlotsByDate[date] = availableSlots;
         final selectedTime = _selectedScheduleTime();
-        if (selectedTime.isNotEmpty && !availableSlots.contains(selectedTime)) {
+        if (selectedTime.isNotEmpty &&
+            !availableSlots.contains(selectedTime)) {
           _clearSelectedScheduleTime();
         }
       });
@@ -5684,12 +6534,19 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     String field,
     Map<String, dynamic> definition,
   ) {
-    final normalized = field.toLowerCase();
+    final fieldText = '$field ${definition['label'] ?? ''}';
+    final normalized = fieldText.toLowerCase();
+    final normalizedWords = fieldText
+        .replaceAllMapped(
+          RegExp(r'([a-z0-9])([A-Z])'),
+          (match) => '${match[1]} ${match[2]}',
+        )
+        .toLowerCase();
+    final isAgeField = RegExp(
+      r'(^|[^a-z])(age|edad)([^a-z]|$)',
+    ).hasMatch(normalizedWords);
     final fieldType = (definition['type'] ?? '').toString().toLowerCase();
-    final isOptional = definition['required'] is bool
-        ? !(definition['required'] as bool)
-        : normalized.contains('optional') || field.endsWith('?');
-    final required = !isOptional;
+    final required = _isDatabaseFieldRequired(field, definition);
     final label = (definition['label'] ?? field)
         .toString()
         .replaceAll(RegExp(r'\s*\*\s*$'), '')
@@ -5698,14 +6555,20 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         .trim();
 
     if (fieldType == 'date' || normalized.contains('date')) {
-          final isBirthDate = normalized.contains('birth') ||
-              normalized.contains('kapanganakan');
+          final isHistoricalDate =
+              normalized.contains('birth') ||
+              normalized.contains('kapanganakan') ||
+              (widget.sacramentType == SacramentType.confirmation &&
+                  (normalized.contains('baptiz') ||
+                      normalized.contains('binyag'))) ||
+              (widget.sacramentType == SacramentType.baptism &&
+                  normalized.contains('marriage'));
           return _buildDateField(
             label,
             key: field,
             required: required,
-            isBirthday: isBirthDate,
-            selectableDayPredicate: isBirthDate
+            isBirthday: isHistoricalDate,
+            selectableDayPredicate: isHistoricalDate
                 ? null
                 : widget.sacramentType == SacramentType.firstCommunion
                 ? (date) => _isSelectableFlexibleRangeBookingDate(date, 365)
@@ -5717,13 +6580,20 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
     if (fieldType == 'time' ||
         normalized.contains('time') ||
         normalized.contains('oras')) {
+      final isBaptismScheduleTime =
+          widget.sacramentType == SacramentType.baptism &&
+          _selectedScheduleTimeKeys().contains(field);
+      final sundayTime = _parseTimeOfDay(_sundayBaptismTime ?? '');
       return _buildTimeField(
         label,
         key: field,
         required: required,
-        allowedTimes: _configuredTimeOptions(definition),
-        disabled: widget.sacramentType == SacramentType.massIntention &&
-            _selectedScheduleDate().isEmpty,
+        allowedTimes: isBaptismScheduleTime && _isSundayBaptismDate
+            ? (sundayTime == null ? const [] : [sundayTime])
+            : _configuredTimeOptions(definition),
+        disabled: (isBaptismScheduleTime && _isSundayBaptismDate) ||
+            (widget.sacramentType == SacramentType.massIntention &&
+                _selectedScheduleDate().isEmpty),
         dropdownOnly: true,
       );
     }
@@ -5735,14 +6605,27 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
             normalized.contains('tel.')) {
           return _buildPhilippinePhoneField(label, key: field, required: required);
     }
-    if (fieldType == 'number' ||
-            normalized.contains('age') ||
-            normalized.contains('edad')) {
-          final minAge = normalized.contains('ninong') || normalized.contains('ninang')
+    if (fieldType == 'number' || isAgeField) {
+          final isBaptismParentAge =
+              widget.sacramentType == SacramentType.baptism &&
+              (normalized.contains('father') ||
+                  normalized.contains('mother') ||
+                  normalized.contains('ama') ||
+                  normalized.contains('ina'));
+          final isConfirmationCandidateAge =
+              widget.sacramentType == SacramentType.confirmation &&
+              isAgeField &&
+              !normalized.contains('ninong') &&
+              !normalized.contains('ninang');
+          final minAge = isBaptismParentAge ||
+                  normalized.contains('ninong') ||
+                  normalized.contains('ninang')
               ? 18
               : (widget.sacramentType == SacramentType.wedding &&
                         (normalized.contains('groom') || normalized.contains('bride'))
                     ? 21
+                    : isConfirmationCandidateAge
+                    ? 7
                     : 0);
           return _buildNumberField(
             label,
@@ -5773,6 +6656,54 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
               key: field, required: required);
     }
     return _buildTextField(label, key: field, required: required);
+  }
+
+  bool _isDatabaseFieldRequired(
+    String field,
+    Map<String, dynamic> definition,
+  ) {
+    final fieldAndLabel = '$field ${definition['label'] ?? ''}'.toLowerCase();
+    if (widget.sacramentType == SacramentType.baptism &&
+        (fieldAndLabel.contains('father') || fieldAndLabel.contains('ama'))) {
+      return false;
+    }
+
+    final validation = definition['validation'] is Map
+        ? Map<String, dynamic>.from(definition['validation'] as Map)
+        : const <String, dynamic>{};
+
+    bool? parseFlag(dynamic value) {
+      if (value is bool) return value;
+      if (value is num && (value == 0 || value == 1)) return value == 1;
+      if (value is String) {
+        switch (value.trim().toLowerCase()) {
+          case 'true':
+          case 'yes':
+          case '1':
+            return true;
+          case 'false':
+          case 'no':
+          case '0':
+            return false;
+        }
+      }
+      return null;
+    }
+
+    for (final source in [definition, validation]) {
+      for (final key in ['required', 'isRequired', 'is_required']) {
+        final flag = parseFlag(source[key]);
+        if (flag != null) return flag;
+      }
+      for (final key in ['optional', 'isOptional', 'is_optional']) {
+        final flag = parseFlag(source[key]);
+        if (flag != null) return !flag;
+      }
+    }
+
+    final label = '$field ${definition['label'] ?? ''}'.toLowerCase();
+    return !RegExp(r'\boptional\b|\bopsyonal\b').hasMatch(label) &&
+        !field.trimRight().endsWith('?');
   }
 
   Widget _buildDetailedBaptismForm(bool isTagalog) {
