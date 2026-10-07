@@ -54,6 +54,13 @@ class _BookingFormFeeCache {
     return _asInt(fees['base'] ?? fees['regular'], 6000);
   }
 
+  int renewalOfVowsAmount() {
+    final fees = _feesByForm['renewal_of_vows'] ??
+        _feesByForm['renewalofvows'] ??
+        const <String, dynamic>{};
+    return _asInt(fees['base'] ?? fees['regular'], 0);
+  }
+
   int _asInt(dynamic value, int fallback) {
     if (value is num) return value.round();
     if (value is String) {
@@ -558,9 +565,11 @@ class BookingsScreen extends StatelessWidget {
     final normalizedStatus = status.toLowerCase();
     final statusOk = normalizedStatus == 'approved' || normalizedStatus == 'accepted';
     
-    // Only allow payment for Wedding and Baptism
+    // Only allow payment for Wedding, Renewal of Vows, and Baptism.
     final lowerType = sacramentType.toLowerCase();
     final isPaymentRequired = (lowerType.contains('wedding') || lowerType.contains('kasal')) ||
+                            (lowerType.contains('renewal') && lowerType.contains('vow')) ||
+                            lowerType.contains('pagpapanibago') ||
                             (lowerType.contains('bapt') || lowerType.contains('binyag'));
     
     return statusOk && isPaymentRequired;
@@ -617,6 +626,10 @@ class BookingsScreen extends StatelessWidget {
     final lowerType = sacramentType.toLowerCase();
     if (lowerType.contains('wedding') || lowerType.contains('kasal')) {
       return _BookingFormFeeCache.instance.weddingAmount();
+    }
+    if ((lowerType.contains('renewal') && lowerType.contains('vow')) ||
+        lowerType.contains('pagpapanibago')) {
+      return _BookingFormFeeCache.instance.renewalOfVowsAmount();
     }
     return 0;
   }

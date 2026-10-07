@@ -508,6 +508,7 @@ function canonicalSacramentType(value) {
   // English
   if (s.includes('bapt')) return 'baptism';
   if (s.includes('confirm')) return 'confirmation';
+  if (s.includes('renewal') && s.includes('vow')) return 'renewal_of_vows';
   if (s.includes('wedding') || s.includes('matrimony') || s.includes('marriage')) return 'wedding';
   if (s.includes('funeral')) return 'funeral';
   if (s.includes('house') && s.includes('bless')) return 'house_blessing';
@@ -518,6 +519,7 @@ function canonicalSacramentType(value) {
   // Tagalog
   if (s.includes('binyag')) return 'baptism';
   if (s.includes('kumpil')) return 'confirmation';
+  if (s.includes('pagpapanibago') && s.includes('panata')) return 'renewal_of_vows';
   if (s.includes('kasal')) return 'wedding';
   if (s.includes('yumao')) return 'funeral';
   if (s.includes('basbas') && s.includes('bahay')) return 'house_blessing';

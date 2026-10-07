@@ -1373,7 +1373,8 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
 
   bool get _usesDatabasePaymentOptions =>
       widget.sacramentType == SacramentType.baptism ||
-      widget.sacramentType == SacramentType.wedding;
+      widget.sacramentType == SacramentType.wedding ||
+      widget.sacramentType == SacramentType.renewalOfVows;
 
   double get _selectedPaymentTotal {
     final base = _selectedPaymentOption?.amount ?? 0;
@@ -1405,14 +1406,20 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           .get();
       final matchingDocs = snapshot.docs.where((doc) {
         final data = doc.data();
-        final requestedId = widget.sacramentType == SacramentType.baptism
-            ? 'baptism'
-            : 'wedding';
+        final requestedId = switch (widget.sacramentType) {
+          SacramentType.baptism => 'baptism',
+          SacramentType.wedding => 'wedding',
+          SacramentType.renewalOfVows => 'renewalofvows',
+          _ => '',
+        };
         final documentId = (data['id'] ?? doc.id)
             .toString()
             .toLowerCase()
             .replaceAll(RegExp(r'[^a-z]'), '');
-        return documentId == requestedId;
+        return documentId == requestedId ||
+            (requestedId == 'renewalofvows' &&
+                documentId.contains('renewal') &&
+                documentId.contains('vow'));
       });
 
       final options = <_ServicePaymentOption>[];
@@ -1445,12 +1452,19 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
           }
         }
       } else if (selectedService != null &&
-          widget.sacramentType == SacramentType.wedding) {
+          (widget.sacramentType == SacramentType.wedding ||
+              widget.sacramentType == SacramentType.renewalOfVows)) {
         final baseAmount = parseAmount(selectedService['baseAmount']);
         if (baseAmount != null && baseAmount > 0) {
           options.add(_ServicePaymentOption(
             id: 'base',
-            label: widget.isTagalog ? 'Pangunahing bayad sa Kasal' : 'Wedding base fee',
+            label: widget.sacramentType == SacramentType.renewalOfVows
+                ? (widget.isTagalog
+                    ? 'Pangunahing bayad sa Pagpapanibago ng Panata'
+                    : 'Renewal of Vows base fee')
+                : (widget.isTagalog
+                    ? 'Pangunahing bayad sa Kasal'
+                    : 'Wedding base fee'),
             amount: baseAmount,
           ));
         }
@@ -1475,11 +1489,12 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         uniqueOptions.putIfAbsent(option.id, () => option);
       }
       final loadedOptions = uniqueOptions.values.toList();
-      _ServicePaymentOption? weddingBaseOption;
-      if (widget.sacramentType == SacramentType.wedding) {
+      _ServicePaymentOption? baseOption;
+      if (widget.sacramentType == SacramentType.wedding ||
+          widget.sacramentType == SacramentType.renewalOfVows) {
         for (final option in loadedOptions) {
           if (!option.isAddon) {
-            weddingBaseOption = option;
+            baseOption = option;
             break;
           }
         }
@@ -1487,8 +1502,10 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
       if (!mounted) return;
       setState(() {
         _paymentOptions = loadedOptions;
-        _selectedPaymentOption = widget.sacramentType == SacramentType.wedding
-            ? weddingBaseOption
+        _selectedPaymentOption =
+            (widget.sacramentType == SacramentType.wedding ||
+                widget.sacramentType == SacramentType.renewalOfVows)
+            ? baseOption
             : null;
         _selectedFeeAddonIds.clear();
         _paymentOptionsError = _paymentOptions.isEmpty
@@ -5351,6 +5368,11 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
         options.contains(_controllers[fieldKey]!.text)) {
       currentVal = _controllers[fieldKey]!.text;
     }
+    if (currentVal != null && !options.contains(currentVal)) {
+      currentVal = null;
+      _dropdownValues.remove(fieldKey);
+      _controllers[fieldKey]!.clear();
+    }
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6.0),
@@ -6621,8 +6643,12 @@ class _SacramentFormScreenState extends State<SacramentFormScreen> {
                   normalized.contains('ninong') ||
                   normalized.contains('ninang')
               ? 18
-              : (widget.sacramentType == SacramentType.wedding &&
-                        (normalized.contains('groom') || normalized.contains('bride'))
+              : (widget.sacramentType == SacramentType.renewalOfVows &&
+                        isAgeField
+                    ? 21
+                    : widget.sacramentType == SacramentType.wedding &&
+                          (normalized.contains('groom') ||
+                              normalized.contains('bride'))
                     ? 21
                     : isConfirmationCandidateAge
                     ? 7
